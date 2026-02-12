@@ -4,7 +4,7 @@ import logging
 
 import anthropic
 
-from pixel_tracer import AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay
+from pixel_tracer import AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay, snap_series_to_pixels
 
 logger = logging.getLogger(__name__)
 
@@ -321,25 +321,28 @@ def refine_extraction(
 # Automatic self-assessment and refinement
 # ---------------------------------------------------------------------------
 
-AUTO_REFINE_SYSTEM_PROMPT = """You are a chart data extraction quality assessor. You are given:
+AUTO_REFINE_SYSTEM_PROMPT = """You are a strict chart data extraction quality assessor. You are given:
 
 1. The ORIGINAL chart image — this is the ground truth.
-2. An OVERLAY image — showing the current extracted data (colored lines) plotted on top of the original chart (faded background).
+2. An OVERLAY image — showing the current extracted data (colored lines) plotted on top of the original chart (faded background). The colored lines should sit EXACTLY on top of the original curves.
 
-Compare the colored extraction lines against the original chart curves in the background. Look for:
-- Curves that don't start or end at the correct values
-- Extracted lines that diverge significantly from the original curves
-- Missing steps in step-function curves (e.g. Kaplan-Meier survival curves)
-- Series that are confused or swapped
-- Regions where the extraction is noticeably above or below the original
+Carefully compare the colored extraction lines against the original chart curves. Check EACH of these, at multiple x-positions along every curve:
 
-You also have the current extracted data as JSON.
+1. ALIGNMENT: At x=0, x=5, x=10, x=15, x=20, x=25, x=30 (or whatever the axis range is), does each colored extraction line sit directly on top of the corresponding original curve? Even a small systematic offset (e.g. consistently 0.05 too low or too high) is a FAILURE that must be corrected.
 
-If the extraction looks accurate (lines closely follow the originals), return the data unchanged and note "Extraction looks accurate" in the notes field.
+2. SHAPE: Do the extraction lines follow the same shape as the originals? Step functions must have steps, not smooth curves. The horizontal and vertical segments must match.
 
-If you see discrepancies, correct the data_series to better match the original chart. Return ALL data points for ALL series. In the notes field, briefly describe what you corrected.
+3. ENDPOINTS: Do curves start and end at exactly the right values? Survival curves start at (0, 1.0).
 
-Call the store_refined_data tool with the (corrected or confirmed) data."""
+4. SEPARATION: Are the two curves correctly separated? If one extraction line is closer to the wrong original curve, the values are wrong.
+
+5. CROSSINGS: If the extraction lines cross each other at points where the originals don't (or vice versa), this is wrong.
+
+You MUST be critical. If ANY colored line deviates from the original curve by more than ~0.03 in y-value at ANY point, correct it. Do NOT say "looks accurate" unless the colored lines truly overlap the originals everywhere.
+
+When correcting, re-read the y-values directly from the ORIGINAL chart image at many x-positions, using the gridlines as reference. Return 50+ points per series with step-function structure preserved.
+
+Call the store_refined_data tool with the corrected data."""
 
 
 def _infer_axis_range(result: dict) -> dict | None:
@@ -368,7 +371,7 @@ def auto_refine_extraction(
     image_bytes: bytes,
     mime_type: str,
     result: dict,
-    max_rounds: int = 1,
+    max_rounds: int = 2,
 ) -> dict:
     """Generate an overlay and have Claude self-assess and correct the extraction.
 
@@ -391,6 +394,16 @@ def auto_refine_extraction(
         logger.info("Cannot auto-refine: no axis range available.")
         return result
 
+    # Step 1: Pixel-snap correction — use actual curve pixels to fix y-values
+    axis = AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"])
+    try:
+        snapped = snap_series_to_pixels(image_bytes, result["data_series"], axis)
+        result = {**result, "data_series": snapped}
+        logger.info("Pixel-snap correction applied to %d series.", len(snapped))
+    except Exception as exc:
+        logger.warning("Pixel-snap failed: %s", exc)
+
+    # Step 2: AI assessment rounds — Claude checks overlay and fine-tunes
     current = result
     for round_num in range(max_rounds):
         try:

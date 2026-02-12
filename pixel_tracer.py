@@ -106,12 +106,64 @@ def _find_longest_runs(
     return best_h, best_v
 
 
+def _find_best_h_run(
+    dark: np.ndarray, row_min: int, row_max: int, min_run: int,
+) -> dict | None:
+    """Find the longest horizontal dark run within the given row range."""
+    _, w = dark.shape
+    best: dict | None = None
+    for row in range(row_min, row_max + 1):
+        run_start = None
+        for col in range(w):
+            if dark[row, col]:
+                if run_start is None:
+                    run_start = col
+            else:
+                if run_start is not None:
+                    run_len = col - run_start
+                    if run_len >= min_run and (best is None or run_len > best["len"]):
+                        best = {"row": row, "len": run_len, "start": run_start, "end": col - 1}
+                    run_start = None
+        if run_start is not None:
+            run_len = w - run_start
+            if run_len >= min_run and (best is None or run_len > best["len"]):
+                best = {"row": row, "len": run_len, "start": run_start, "end": w - 1}
+    return best
+
+
+def _find_best_v_run(
+    dark: np.ndarray, col_min: int, col_max: int, min_run: int,
+) -> dict | None:
+    """Find the longest vertical dark run within the given column range."""
+    h, _ = dark.shape
+    best: dict | None = None
+    for col in range(col_min, col_max + 1):
+        run_start = None
+        for row in range(h):
+            if dark[row, col]:
+                if run_start is None:
+                    run_start = row
+            else:
+                if run_start is not None:
+                    run_len = row - run_start
+                    if run_len >= min_run and (best is None or run_len > best["len"]):
+                        best = {"col": col, "len": run_len, "start": run_start, "end": row - 1}
+                    run_start = None
+        if run_start is not None:
+            run_len = h - run_start
+            if run_len >= min_run and (best is None or run_len > best["len"]):
+                best = {"col": col, "len": run_len, "start": run_start, "end": h - 1}
+    return best
+
+
 def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None:
     """Detect plot area by finding long dark horizontal/vertical pixel runs.
 
     Tries progressively lighter thresholds to handle gray axis lines.
-    If a y-axis line cannot be found, falls back to using the x-axis
-    start column as the left bound.
+    Skips edge rows/columns to avoid matching image borders.
+    The x-axis is searched in the lower 2/3 of the image; the y-axis in
+    the left 2/3.  If a y-axis cannot be found, falls back to using the
+    x-axis start column as the left bound.
 
     Args:
         img: RGB image array (H, W, 3), uint8.
@@ -123,19 +175,26 @@ def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None
     h, w = img.shape[:2]
     gray = img.mean(axis=2)
 
+    # Margin to skip: ignore the outermost pixels (image borders)
+    edge = max(3, min(h, w) // 50)
+
     best_h: dict | None = None
     best_v: dict | None = None
 
     # Try progressively lighter thresholds
     for threshold in (80, 128, 160):
         dark = gray < threshold
-        bh, bv = _find_longest_runs(dark)
 
-        if best_h is None or bh["len"] > best_h["len"]:
-            if bh["len"] >= min_run:
+        # x-axis: search lower 2/3, skip edge rows
+        if best_h is None:
+            bh = _find_best_h_run(dark, max(edge, h // 3), h - edge - 1, min_run)
+            if bh is not None:
                 best_h = bh
-        if best_v is None or bv["len"] > best_v["len"]:
-            if bv["len"] >= min_run:
+
+        # y-axis: search left 2/3, skip edge columns
+        if best_v is None:
+            bv = _find_best_v_run(dark, edge, w * 2 // 3, min_run)
+            if bv is not None:
                 best_v = bv
 
         if best_h is not None and best_v is not None:
@@ -151,7 +210,7 @@ def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None
         # Scan for topmost dark pixel above the x-axis in the plot area
         dark_any = gray < 160
         top = best_h["row"]
-        for row in range(best_h["row"] - 1, -1, -1):
+        for row in range(best_h["row"] - 1, edge, -1):
             if np.any(dark_any[row, left:best_h["end"] + 1]):
                 top = row
         return PlotBounds(
@@ -763,6 +822,151 @@ def extract_curves_from_image(
                 }
 
     return [r for r in results if r is not None]
+
+
+# ---------------------------------------------------------------------------
+# Pixel-snap correction: fix AI-extracted y-values using actual curve pixels
+# ---------------------------------------------------------------------------
+
+def _data_to_pixel(
+    x: float, y: float, bounds: PlotBounds, axis_range: AxisRange
+) -> tuple[int, int]:
+    """Convert data coordinates to pixel coordinates (col, row)."""
+    x_frac = (x - axis_range.x_min) / (axis_range.x_max - axis_range.x_min)
+    y_frac = (y - axis_range.y_min) / (axis_range.y_max - axis_range.y_min)
+    col = int(bounds.left + x_frac * (bounds.right - bounds.left))
+    row = int(bounds.bottom - y_frac * (bounds.bottom - bounds.top))
+    return (
+        max(bounds.left, min(bounds.right, col)),
+        max(bounds.top, min(bounds.bottom, row)),
+    )
+
+
+def snap_series_to_pixels(
+    image_bytes: bytes,
+    data_series: list[dict],
+    axis_range: AxisRange,
+    search_radius: int = 25,
+) -> list[dict]:
+    """Snap AI-extracted data points to actual curve pixels in the original image.
+
+    For each data point, finds the nearest dark pixel vertically in the
+    original image and corrects the y-value.  This combines the AI's ability
+    to identify and separate curves with pixel-level measurement precision.
+
+    When multiple series are present, points are snapped in order from the
+    series with the highest y-values to lowest, and already-claimed pixels
+    are avoided so nearby curves don't collapse onto each other.
+
+    Args:
+        image_bytes: Original chart image bytes.
+        data_series: AI-extracted [{"name", "data": [{"x", "y"}, ...]}, ...].
+        axis_range: Data-coordinate axis ranges.
+        search_radius: Max pixel distance to search vertically.
+
+    Returns:
+        Corrected data_series (same structure, more accurate y-values).
+    """
+    img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    bounds = detect_plot_bounds(img)
+    if bounds is None or bounds.height < 20:
+        return data_series
+
+    gray = img.mean(axis=2)
+
+    # Build dark-pixel mask: curve pixels but not background, and exclude
+    # axis lines by position.
+    dark = gray < 160
+    # Exclude near-white
+    brightness = img[:, :, 0].astype(int) + img[:, :, 1].astype(int) + img[:, :, 2].astype(int)
+    dark = dark & (brightness < 680)
+    # Exclude axis lines by position
+    axis_margin = 4
+    for r in range(max(0, bounds.bottom - axis_margin),
+                   min(img.shape[0], bounds.bottom + axis_margin + 1)):
+        dark[r, :] = False
+    for c in range(max(0, bounds.left - axis_margin),
+                   min(img.shape[1], bounds.left + axis_margin + 1)):
+        dark[:, c] = False
+
+    # For each column, find all dark-pixel segments (contiguous vertical runs)
+    # so we can snap to segment centers rather than individual pixels.
+    def _segments_at_col(col: int) -> list[float]:
+        """Return sorted list of row-centers of dark segments at this column."""
+        col_lo = max(bounds.left, col - 2)
+        col_hi = min(bounds.right, col + 2)
+        band = dark[bounds.top:bounds.bottom + 1, col_lo:col_hi + 1].any(axis=1)
+        rows = np.where(band)[0] + bounds.top
+        if len(rows) == 0:
+            return []
+        diffs = np.diff(rows)
+        splits = np.where(diffs > 3)[0] + 1
+        segments = np.split(rows, splits)
+        return sorted(float(s.mean()) for s in segments if len(s) >= 1)
+
+    # Pre-compute segments for all columns in the plot area
+    col_segments: dict[int, list[float]] = {}
+    for col in range(bounds.left, bounds.right + 1):
+        segs = _segments_at_col(col)
+        if segs:
+            col_segments[col] = segs
+
+    # Process series: snap each point to the nearest unclaimed segment
+    # Process from top curve to bottom so claimed-row tracking works.
+    series_order = list(range(len(data_series)))
+
+    # Track which segment rows are "claimed" at each column to prevent
+    # multiple series snapping to the same curve.
+    claimed: dict[int, set[int]] = {}  # col -> set of segment indices
+
+    corrected_series: list[dict] = [None] * len(data_series)  # type: ignore
+    for si in series_order:
+        series = data_series[si]
+        corrected_points = []
+        for pt in series.get("data", []):
+            if "x" not in pt or "y" not in pt:
+                corrected_points.append(pt)
+                continue
+
+            x, y = float(pt["x"]), float(pt["y"])
+            col, row = _data_to_pixel(x, y, bounds, axis_range)
+
+            # Find the nearest unclaimed segment
+            segs = col_segments.get(col, [])
+            col_claimed = claimed.get(col, set())
+
+            best_row: float | None = None
+            best_seg_idx: int | None = None
+            best_dist = search_radius + 1
+            for idx, seg_row in enumerate(segs):
+                if idx in col_claimed:
+                    continue
+                dist = abs(seg_row - row)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_row = seg_row
+                    best_seg_idx = idx
+
+            if best_row is not None and best_seg_idx is not None:
+                _, corrected_y = pixel_to_data(col, best_row, bounds, axis_range)
+                corrected_points.append({"x": round(x, 4), "y": round(corrected_y, 4)})
+                # Claim this segment
+                if col not in claimed:
+                    claimed[col] = set()
+                claimed[col].add(best_seg_idx)
+            else:
+                corrected_points.append(pt)
+
+        # Apply median filter to smooth out noise from snapping
+        if len(corrected_points) >= 7:
+            ys = np.array([p["y"] for p in corrected_points])
+            smooth = median_filter(ys, size=5)
+            for i, p in enumerate(corrected_points):
+                p["y"] = round(float(smooth[i]), 4)
+
+        corrected_series[si] = {"name": series["name"], "data": corrected_points}
+
+    return corrected_series
 
 
 # A set of distinct colors for overlay lines (tab20 palette).
