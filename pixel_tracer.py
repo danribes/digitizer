@@ -56,11 +56,60 @@ class SeriesSpec:
     monotonic: str | None = None  # "decreasing", "increasing", or None
 
 
+def _find_longest_runs(
+    dark: np.ndarray,
+) -> tuple[dict, dict]:
+    """Find the longest horizontal and vertical contiguous dark runs.
+
+    Returns (best_h, best_v) dicts with row/col, start, end, len keys.
+    """
+    h, w = dark.shape
+
+    best_h: dict = {"row": -1, "len": 0, "start": 0, "end": 0}
+    for row in range(h):
+        run_start = None
+        for col in range(w):
+            if dark[row, col]:
+                if run_start is None:
+                    run_start = col
+            else:
+                if run_start is not None:
+                    run_len = col - run_start
+                    if run_len > best_h["len"]:
+                        best_h = {"row": row, "len": run_len, "start": run_start, "end": col - 1}
+                    run_start = None
+        if run_start is not None:
+            run_len = w - run_start
+            if run_len > best_h["len"]:
+                best_h = {"row": row, "len": run_len, "start": run_start, "end": w - 1}
+
+    best_v: dict = {"col": -1, "len": 0, "start": 0, "end": 0}
+    for col in range(w):
+        run_start = None
+        for row in range(h):
+            if dark[row, col]:
+                if run_start is None:
+                    run_start = row
+            else:
+                if run_start is not None:
+                    run_len = row - run_start
+                    if run_len > best_v["len"]:
+                        best_v = {"col": col, "len": run_len, "start": run_start, "end": row - 1}
+                    run_start = None
+        if run_start is not None:
+            run_len = h - run_start
+            if run_len > best_v["len"]:
+                best_v = {"col": col, "len": run_len, "start": run_start, "end": h - 1}
+
+    return best_h, best_v
+
+
 def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None:
     """Detect plot area by finding long dark horizontal/vertical pixel runs.
 
-    Scans for axis lines — long contiguous runs of dark pixels along rows
-    (horizontal axis) and columns (vertical axis).
+    Tries progressively lighter thresholds to handle gray axis lines.
+    If a y-axis line cannot be found, falls back to using the x-axis
+    start column as the left bound.
 
     Args:
         img: RGB image array (H, W, 3), uint8.
@@ -71,77 +120,50 @@ def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None
     """
     h, w = img.shape[:2]
     gray = img.mean(axis=2)
-    dark = gray < 80  # near-black pixels
 
-    # Find longest horizontal dark run per row
-    best_h_row = -1
-    best_h_len = 0
-    best_h_start = 0
-    best_h_end = 0
+    best_h: dict | None = None
+    best_v: dict | None = None
 
-    for row in range(h):
-        run_start = None
-        for col in range(w):
-            if dark[row, col]:
-                if run_start is None:
-                    run_start = col
-            else:
-                if run_start is not None:
-                    run_len = col - run_start
-                    if run_len > best_h_len:
-                        best_h_len = run_len
-                        best_h_row = row
-                        best_h_start = run_start
-                        best_h_end = col - 1
-                    run_start = None
-        # Handle run ending at edge
-        if run_start is not None:
-            run_len = w - run_start
-            if run_len > best_h_len:
-                best_h_len = run_len
-                best_h_row = row
-                best_h_start = run_start
-                best_h_end = w - 1
+    # Try progressively lighter thresholds
+    for threshold in (80, 128, 160):
+        dark = gray < threshold
+        bh, bv = _find_longest_runs(dark)
 
-    # Find longest vertical dark run per column
-    best_v_col = -1
-    best_v_len = 0
-    best_v_start = 0
-    best_v_end = 0
+        if best_h is None or bh["len"] > best_h["len"]:
+            if bh["len"] >= min_run:
+                best_h = bh
+        if best_v is None or bv["len"] > best_v["len"]:
+            if bv["len"] >= min_run:
+                best_v = bv
 
-    for col in range(w):
-        run_start = None
-        for row in range(h):
-            if dark[row, col]:
-                if run_start is None:
-                    run_start = row
-            else:
-                if run_start is not None:
-                    run_len = row - run_start
-                    if run_len > best_v_len:
-                        best_v_len = run_len
-                        best_v_col = col
-                        best_v_start = run_start
-                        best_v_end = row - 1
-                    run_start = None
-        if run_start is not None:
-            run_len = h - run_start
-            if run_len > best_v_len:
-                best_v_len = run_len
-                best_v_col = col
-                best_v_start = run_start
-                best_v_end = h - 1
+        if best_h is not None and best_v is not None:
+            break
 
-    if best_h_len < min_run or best_v_len < min_run:
+    if best_h is None:
         return None
 
-    # Plot area: left edge = vertical axis col, right edge = horizontal axis end,
-    # top edge = vertical axis start, bottom edge = horizontal axis row.
+    # If we found x-axis but no y-axis, infer left bound from x-axis start
+    # and top bound by scanning upward for the topmost dark curve pixel.
+    if best_v is None:
+        left = best_h["start"]
+        # Scan for topmost dark pixel above the x-axis in the plot area
+        dark_any = gray < 160
+        top = best_h["row"]
+        for row in range(best_h["row"] - 1, -1, -1):
+            if np.any(dark_any[row, left:best_h["end"] + 1]):
+                top = row
+        return PlotBounds(
+            left=left,
+            right=best_h["end"],
+            top=top,
+            bottom=best_h["row"],
+        )
+
     return PlotBounds(
-        left=best_v_col,
-        right=best_h_end,
-        top=best_v_start,
-        bottom=best_h_row,
+        left=best_v["col"],
+        right=best_h["end"],
+        top=best_v["start"],
+        bottom=best_h["row"],
     )
 
 

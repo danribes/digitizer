@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+*.png
+*.webp
+*.gif
+*.json
+extract_km*.py
+km_*.png
