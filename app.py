@@ -1,6 +1,6 @@
 import streamlit as st
 
-from extractor import extract_chart_data, extract_chart_data_hybrid
+from extractor import extract_chart_data, extract_chart_data_hybrid, refine_extraction
 from export import to_csv, to_json, to_excel, to_python, _build_combined_df
 from pixel_tracer import AxisRange, generate_overlay
 
@@ -33,11 +33,69 @@ extraction_method = st.sidebar.radio(
 # Upload
 uploaded = st.file_uploader("Upload a chart image", type=SUPPORTED_TYPES)
 
+
+def _get_axis_range(result: dict) -> dict | None:
+    """Get axis_range from result, inferring from data if not present."""
+    if result.get("axis_range"):
+        return result["axis_range"]
+
+    # Infer from data_series min/max for AI-only results
+    all_x, all_y = [], []
+    for series in result.get("data_series", []):
+        for pt in series.get("data", []):
+            if "x" in pt and "y" in pt:
+                all_x.append(pt["x"])
+                all_y.append(pt["y"])
+    if not all_x or not all_y:
+        return None
+
+    # Add a small margin (5%) around the data range
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    x_margin = (x_max - x_min) * 0.05 if x_max != x_min else 1.0
+    y_margin = (y_max - y_min) * 0.05 if y_max != y_min else 1.0
+    return {
+        "x_min": x_min - x_margin,
+        "x_max": x_max + x_margin,
+        "y_min": y_min - y_margin,
+        "y_max": y_max + y_margin,
+    }
+
+
+def _generate_overlay_cached(image_bytes: bytes, result: dict, result_version: int) -> bytes | None:
+    """Generate overlay and cache in session state. Regenerates when result_version changes."""
+    cached_version = st.session_state.get("overlay_version")
+    if cached_version == result_version and st.session_state.get("overlay_bytes"):
+        return st.session_state["overlay_bytes"]
+
+    ar = _get_axis_range(result)
+    if ar is None:
+        return None
+
+    try:
+        overlay = generate_overlay(
+            image_bytes,
+            result["data_series"],
+            AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
+        )
+        st.session_state["overlay_bytes"] = overlay
+        st.session_state["overlay_version"] = result_version
+        return overlay
+    except Exception:
+        return None
+
+
 if uploaded is not None:
     image_bytes = uploaded.getvalue()
     mime_type = uploaded.type or "image/png"
 
     if st.button("Extract Data", type="primary"):
+        # Clear chat state on new extraction
+        st.session_state.pop("chat_messages", None)
+        st.session_state.pop("overlay_bytes", None)
+        st.session_state.pop("overlay_version", None)
+        st.session_state["result_version"] = 0
+
         hint = chart_type_hint if chart_type_hint != "Auto-detect" else None
         use_hybrid = extraction_method == "Pixel-enhanced (hybrid)"
         spinner_text = (
@@ -53,6 +111,10 @@ if uploaded is not None:
                     result = extract_chart_data(image_bytes, mime_type, chart_type_hint=hint)
                     result["extraction_method"] = "ai-only"
                 st.session_state["result"] = result
+                st.session_state["image_bytes"] = image_bytes
+                st.session_state["mime_type"] = mime_type
+                st.session_state["chat_messages"] = []
+                st.session_state["result_version"] = 0
             except Exception as e:
                 st.error(f"Extraction failed: {e}")
 
@@ -77,19 +139,68 @@ if uploaded is not None:
                 st.info(result["notes"])
             st.markdown(f"**Series:** {len(result.get('data_series', []))}")
 
-        # Overlay visualization for pixel-enhanced results
-        if result.get("extraction_method") == "pixel-enhanced" and result.get("axis_range"):
+        # Overlay visualization (works for both pixel-enhanced and AI-only with XY data)
+        result_version = st.session_state.get("result_version", 0)
+        overlay = _generate_overlay_cached(image_bytes, result, result_version)
+        if overlay is not None:
             st.subheader("Extraction Overlay")
-            ar = result["axis_range"]
-            try:
-                overlay_bytes = generate_overlay(
-                    image_bytes,
-                    result["data_series"],
-                    AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
-                )
-                st.image(overlay_bytes, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Could not generate overlay: {e}")
+            st.image(overlay, use_container_width=True)
+
+        # Chat-based refinement section
+        if overlay is not None:
+            st.subheader("Refine Extraction")
+
+            chat_messages = st.session_state.get("chat_messages", [])
+
+            # Display chat history
+            for msg in chat_messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # Chat input
+            user_input = st.chat_input("Describe what needs correction...")
+            if user_input:
+                chat_messages.append({"role": "user", "content": user_input})
+                st.session_state["chat_messages"] = chat_messages
+
+                with st.chat_message("user"):
+                    st.markdown(user_input)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("Refining extraction..."):
+                        try:
+                            stored_image = st.session_state.get("image_bytes", image_bytes)
+                            stored_mime = st.session_state.get("mime_type", mime_type)
+
+                            refined = refine_extraction(
+                                image_bytes=stored_image,
+                                mime_type=stored_mime,
+                                overlay_bytes=overlay,
+                                current_result=result,
+                                chat_history=chat_messages,
+                            )
+
+                            # Preserve extraction_method and axis_range from original
+                            refined["extraction_method"] = result.get("extraction_method", "ai-only")
+                            if result.get("axis_range"):
+                                refined["axis_range"] = result["axis_range"]
+
+                            st.session_state["result"] = refined
+
+                            # Assistant response from notes
+                            assistant_msg = refined.get("notes", "Extraction updated.")
+                            chat_messages.append({"role": "assistant", "content": assistant_msg})
+                            st.session_state["chat_messages"] = chat_messages
+
+                            # Bump version to regenerate overlay
+                            st.session_state["result_version"] = result_version + 1
+
+                            st.rerun()
+                        except Exception as e:
+                            error_msg = f"Refinement failed: {e}"
+                            st.error(error_msg)
+                            chat_messages.append({"role": "assistant", "content": error_msg})
+                            st.session_state["chat_messages"] = chat_messages
 
         # Data table
         st.subheader("Extracted Data")

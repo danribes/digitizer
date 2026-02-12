@@ -62,6 +62,75 @@ EXTRACTION_TOOL = {
     },
 }
 
+REFINEMENT_TOOL = {
+    "name": "store_refined_data",
+    "description": "Store the refined/corrected chart data after incorporating user feedback.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "chart_type": {
+                "type": "string",
+                "description": "Detected chart type (e.g. line, bar, scatter, pie, polar, heatmap, ternary, other).",
+            },
+            "title": {
+                "type": "string",
+                "description": "Chart title if visible, otherwise empty string.",
+            },
+            "x_label": {
+                "type": "string",
+                "description": "X-axis label if visible, otherwise empty string.",
+            },
+            "y_label": {
+                "type": "string",
+                "description": "Y-axis label if visible, otherwise empty string.",
+            },
+            "data_series": {
+                "type": "array",
+                "description": "List of data series extracted from the chart.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Series name from legend or inferred label.",
+                        },
+                        "data": {
+                            "type": "array",
+                            "description": "Data points. Use {x, y} for XY plots or {label, value} for categorical/pie charts.",
+                            "items": {
+                                "type": "object",
+                            },
+                        },
+                    },
+                    "required": ["name", "data"],
+                },
+            },
+            "notes": {
+                "type": "string",
+                "description": "Summary of what was changed in this refinement round.",
+            },
+        },
+        "required": ["chart_type", "title", "x_label", "y_label", "data_series", "notes"],
+    },
+}
+
+REFINEMENT_SYSTEM_PROMPT = """You are a chart data extraction expert performing a refinement pass. You are given:
+
+1. The ORIGINAL chart image — this is the ground truth.
+2. An OVERLAY image — showing the current extracted data plotted on top of the original chart. Colored lines are the extracted curves; the faded background is the original chart.
+3. The current extracted data as JSON.
+4. User feedback describing what needs correction.
+
+Your job:
+- Compare the overlay against the original chart to see where the extraction diverges.
+- Incorporate the user's feedback to correct the data_series.
+- Re-extract ALL data points for ALL series (not just the ones mentioned), ensuring the corrected data matches the original chart as closely as possible.
+- Preserve the chart_type, title, x_label, and y_label unless the user says they are wrong.
+- In the notes field, briefly summarize what you changed.
+
+Call the store_refined_data tool with the corrected data."""
+
+
 SYSTEM_PROMPT = """You are a chart data extraction expert. You analyze chart/plot images and extract all visible data points as accurately as possible.
 
 Instructions:
@@ -136,6 +205,112 @@ def extract_chart_data(
     raise RuntimeError("Claude did not return structured chart data.")
 
 
+def refine_extraction(
+    image_bytes: bytes,
+    mime_type: str,
+    overlay_bytes: bytes,
+    current_result: dict,
+    chat_history: list[dict],
+) -> dict:
+    """Refine an extraction based on user feedback via chat.
+
+    Sends both the original chart image and the current overlay to Claude,
+    along with the current extracted data and full chat history, so Claude
+    can see where the extraction diverges and correct it.
+
+    Args:
+        image_bytes: Original chart image bytes.
+        mime_type: MIME type of the original image.
+        overlay_bytes: PNG bytes of the current overlay visualization.
+        current_result: Current extraction result dict.
+        chat_history: List of {"role": "user"/"assistant", "content": str}.
+
+    Returns:
+        Updated result dict (same shape as extract_chart_data output).
+    """
+    client = anthropic.Anthropic()
+
+    b64_original = base64.standard_b64encode(image_bytes).decode("utf-8")
+    b64_overlay = base64.standard_b64encode(overlay_bytes).decode("utf-8")
+
+    # Serialize current data for context
+    current_data_json = json.dumps({
+        "chart_type": current_result.get("chart_type", ""),
+        "title": current_result.get("title", ""),
+        "x_label": current_result.get("x_label", ""),
+        "y_label": current_result.get("y_label", ""),
+        "data_series": current_result.get("data_series", []),
+    }, indent=2)
+
+    # Build messages: initial context with images + data, then chat history
+    initial_content = [
+        {
+            "type": "text",
+            "text": "Here is the ORIGINAL chart image:",
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": b64_original,
+            },
+        },
+        {
+            "type": "text",
+            "text": "Here is the OVERLAY image showing the current extraction plotted over the original chart:",
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": b64_overlay,
+            },
+        },
+        {
+            "type": "text",
+            "text": f"Current extracted data:\n```json\n{current_data_json}\n```",
+        },
+    ]
+
+    messages = [{"role": "user", "content": initial_content}]
+
+    # Append chat history (alternating user/assistant messages)
+    for msg in chat_history:
+        role = msg["role"]
+        content = msg["content"]
+        # Merge consecutive same-role messages or add new ones
+        if messages and messages[-1]["role"] == role:
+            # Append to existing message content
+            prev = messages[-1]["content"]
+            if isinstance(prev, str):
+                messages[-1]["content"] = prev + "\n" + content
+            elif isinstance(prev, list):
+                prev.append({"type": "text", "text": content})
+        else:
+            messages.append({"role": role, "content": content})
+
+    # Ensure the last message is from the user (API requirement)
+    if messages[-1]["role"] != "user":
+        messages.append({"role": "user", "content": "Please refine the extraction based on the feedback above."})
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=8192,
+        system=REFINEMENT_SYSTEM_PROMPT,
+        tools=[REFINEMENT_TOOL],
+        tool_choice={"type": "tool", "name": "store_refined_data"},
+        messages=messages,
+    )
+
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "store_refined_data":
+            return block.input
+
+    raise RuntimeError("Claude did not return refined chart data.")
+
+
 # ---------------------------------------------------------------------------
 # Metadata extraction (for pixel-enhanced hybrid mode)
 # ---------------------------------------------------------------------------
@@ -198,6 +373,11 @@ METADATA_TOOL = {
                             "enum": ["decreasing", "increasing", "none"],
                             "description": "Whether the series is monotonically decreasing (e.g. survival curves), increasing, or neither.",
                         },
+                        "line_style": {
+                            "type": "string",
+                            "enum": ["solid", "dashed", "dotted", "unknown"],
+                            "description": "Line style of this series: solid, dashed, dotted, or unknown if not distinguishable.",
+                        },
                     },
                     "required": ["name", "color_rgb", "monotonic"],
                 },
@@ -222,6 +402,7 @@ Instructions:
 - Read the axis ranges: the minimum and maximum numeric values on each axis.
 - For each data series, identify its name (from legend or inferred) and its approximate RGB color as seen in the image.
 - Determine if each series is monotonically decreasing (e.g. Kaplan-Meier survival curves), increasing, or neither.
+- Identify the line style of each series: "solid" for continuous lines, "dashed" for lines with longer gaps, "dotted" for lines with short dots/gaps, or "unknown" if you cannot tell. This is especially important when multiple series share the same color and are differentiated only by line style.
 - Set pixel_traceable to true ONLY if the chart has clear colored lines or step curves against a white/light background. Bars, pies, heatmaps, filled areas with overlap, and scatter-only charts are NOT pixel-traceable.
 
 Call the store_chart_metadata tool with the metadata."""
@@ -319,11 +500,15 @@ def extract_chart_data_hybrid(
         for s in meta.get("series", []):
             rgb = tuple(s["color_rgb"][:3])
             mono = s.get("monotonic", "none")
+            ls = s.get("line_style")
+            if ls not in ("solid", "dashed", "dotted"):
+                ls = None
             series_specs.append(SeriesSpec(
                 name=s["name"],
                 rgb=rgb,
                 tolerance=50,
                 monotonic=mono if mono != "none" else None,
+                line_style=ls,
             ))
 
         if not series_specs:
