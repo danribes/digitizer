@@ -1,8 +1,15 @@
+import os
+from datetime import datetime
+from pathlib import Path
+
 import streamlit as st
 
 from extractor import extract_chart_data, extract_chart_data_hybrid, refine_extraction
 from export import to_csv, to_json, to_excel, to_python, _build_combined_df
 from pixel_tracer import AxisRange, generate_overlay
+
+OVERLAYS_DIR = Path(__file__).parent / "overlays"
+OVERLAYS_DIR.mkdir(exist_ok=True)
 
 CHART_TYPES = [
     "Auto-detect",
@@ -80,9 +87,28 @@ def _generate_overlay_cached(image_bytes: bytes, result: dict, result_version: i
         )
         st.session_state["overlay_bytes"] = overlay
         st.session_state["overlay_version"] = result_version
+        _save_overlay(overlay)
         return overlay
     except Exception:
         return None
+
+
+def _save_overlay(overlay_bytes: bytes) -> None:
+    """Save overlay PNG to the overlays/ directory with a timestamped filename."""
+    filename = st.session_state.get("overlay_filename")
+    version = st.session_state.get("result_version", 0)
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_overlay.png"
+        st.session_state["overlay_filename"] = filename
+
+    if version > 0:
+        base, ext = os.path.splitext(filename)
+        save_name = f"{base}_v{version}{ext}"
+    else:
+        save_name = filename
+
+    (OVERLAYS_DIR / save_name).write_bytes(overlay_bytes)
 
 
 if uploaded is not None:
@@ -94,6 +120,7 @@ if uploaded is not None:
         st.session_state.pop("chat_messages", None)
         st.session_state.pop("overlay_bytes", None)
         st.session_state.pop("overlay_version", None)
+        st.session_state.pop("overlay_filename", None)
         st.session_state["result_version"] = 0
 
         hint = chart_type_hint if chart_type_hint != "Auto-detect" else None

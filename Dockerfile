@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py extractor.py export.py pixel_tracer.py ./
+RUN mkdir -p overlays
 
 EXPOSE 8501
 
