@@ -20,20 +20,28 @@ Upload a chart screenshot, get back clean data points you can export as CSV, JSO
 
 ## Quick Start
 
+Create a `.env` file with your API key:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
 ### Docker (recommended)
 
 ```bash
 docker build -t digitizer .
-docker run -p 8501:8501 -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" digitizer
+docker run -p 8501:8501 --env-file .env -v ./overlays:/app/overlays digitizer
 ```
 
 Open http://localhost:8501
+
+The `-v ./overlays:/app/overlays` mount persists overlay images to your host.
 
 ### Local
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY="your-key-here"
+source .env
 streamlit run app.py
 ```
 
@@ -71,7 +79,9 @@ app.py            Streamlit UI
 extractor.py      Claude API extraction and refinement
 pixel_tracer.py   Pixel-level curve tracing and overlay generation
 export.py         CSV, JSON, Excel, and Python export
+overlays/         Saved overlay images (gitignored)
 Dockerfile        Container configuration
+.env              API key (gitignored, create manually)
 ```
 
 ## Requirements
