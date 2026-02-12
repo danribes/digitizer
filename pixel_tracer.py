@@ -791,25 +791,42 @@ def generate_overlay(
     """
     img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
     bounds = detect_plot_bounds(img)
-    if bounds is None:
-        raise ValueError("Could not detect plot bounds for overlay.")
 
     h, w = img.shape[:2]
-    x_span = bounds.right - bounds.left
-    y_span = bounds.bottom - bounds.top
-    dx = axis_range.x_max - axis_range.x_min
-    dy = axis_range.y_max - axis_range.y_min
 
-    img_x_left = axis_range.x_min - (bounds.left / x_span) * dx
-    img_x_right = axis_range.x_min + ((w - bounds.left) / x_span) * dx
-    img_y_top = axis_range.y_min + ((bounds.bottom) / y_span) * dy
-    img_y_bottom = axis_range.y_min + ((bounds.bottom - h) / y_span) * dy
+    # Compute image extent in data coordinates so the background aligns
+    # with the extracted curves.  When plot-bounds detection succeeds and
+    # gives a sensible region we map pixel→data precisely; otherwise we
+    # fall back to filling the axis range with the whole image.
+    if (bounds is not None
+            and bounds.width > 20 and bounds.height > 20
+            and bounds.bottom > bounds.top):
+        x_span = bounds.right - bounds.left
+        y_span = bounds.bottom - bounds.top
+        dx = axis_range.x_max - axis_range.x_min
+        dy = axis_range.y_max - axis_range.y_min
+
+        img_x_left = axis_range.x_min - (bounds.left / x_span) * dx
+        img_x_right = axis_range.x_min + ((w - bounds.left) / x_span) * dx
+        img_y_top = axis_range.y_min + ((bounds.bottom) / y_span) * dy
+        img_y_bottom = axis_range.y_min + ((bounds.bottom - h) / y_span) * dy
+    else:
+        # Fallback: stretch the image across the full axis range with a
+        # small margin so labels/titles outside the plot area are visible.
+        dx = axis_range.x_max - axis_range.x_min
+        dy = axis_range.y_max - axis_range.y_min
+        margin_x = dx * 0.12
+        margin_y = dy * 0.12
+        img_x_left = axis_range.x_min - margin_x
+        img_x_right = axis_range.x_max + margin_x
+        img_y_bottom = axis_range.y_min - margin_y
+        img_y_top = axis_range.y_max + margin_y
 
     fig, ax = plt.subplots(figsize=(14, 8))
     ax.imshow(
         img / 255.0,
         extent=[img_x_left, img_x_right, img_y_bottom, img_y_top],
-        aspect="auto", alpha=0.45, zorder=0,
+        aspect="auto", alpha=0.75, zorder=0,
     )
 
     for i, series in enumerate(data_series):

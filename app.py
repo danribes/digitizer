@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from extractor import extract_chart_data, extract_chart_data_hybrid, refine_extraction
+from extractor import extract_chart_data, extract_chart_data_hybrid, refine_extraction, auto_refine_extraction
 from export import to_csv, to_json, to_excel, to_python, _build_combined_df
 from pixel_tracer import AxisRange, generate_overlay
 
@@ -137,13 +137,27 @@ if uploaded is not None:
                 else:
                     result = extract_chart_data(image_bytes, mime_type, chart_type_hint=hint)
                     result["extraction_method"] = "ai-only"
-                st.session_state["result"] = result
-                st.session_state["image_bytes"] = image_bytes
-                st.session_state["mime_type"] = mime_type
-                st.session_state["chat_messages"] = []
-                st.session_state["result_version"] = 0
             except Exception as e:
                 st.error(f"Extraction failed: {e}")
+                result = None
+
+        if result is not None:
+            with st.spinner("Verifying extraction against original chart..."):
+                try:
+                    result = auto_refine_extraction(image_bytes, mime_type, result)
+                    # Pull out the pre-generated overlay if available
+                    overlay_from_refine = result.pop("_overlay_bytes", None)
+                    if overlay_from_refine:
+                        st.session_state["overlay_bytes"] = overlay_from_refine
+                        st.session_state["overlay_version"] = 0
+                except Exception:
+                    pass  # Auto-refine is best-effort; keep original result
+
+            st.session_state["result"] = result
+            st.session_state["image_bytes"] = image_bytes
+            st.session_state["mime_type"] = mime_type
+            st.session_state["chat_messages"] = []
+            st.session_state["result_version"] = 0
 
     if "result" in st.session_state:
         result = st.session_state["result"]

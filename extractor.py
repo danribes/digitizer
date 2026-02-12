@@ -4,7 +4,7 @@ import logging
 
 import anthropic
 
-from pixel_tracer import AxisRange, SeriesSpec, extract_curves_from_image
+from pixel_tracer import AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,12 @@ Instructions:
 - If a series name is not shown in a legend, infer a reasonable name (e.g. "Series 1").
 - Note any uncertainties in the notes field.
 
+Accuracy guidelines:
+- Extract a LARGE number of data points (50+ per series when the curve has detail). More points = better fidelity.
+- For step functions (Kaplan-Meier survival curves, cumulative distributions, etc.), extract BOTH the start and end of every horizontal segment AND every vertical drop. Each step needs at least two points: one just before the drop and one just after. Do NOT smooth steps into curves.
+- Capture exact boundary values: the first and last data point of each series must match what the chart shows precisely (e.g. survival curves start at exactly y=1.0 at x=0).
+- When axes have clear numeric gridlines, snap values to the grid where the data visually aligns with gridlines.
+
 Call the store_chart_data tool with the extracted data."""
 
 
@@ -173,7 +179,7 @@ def extract_chart_data(
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=16384,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
         tool_choice={"type": "tool", "name": "store_chart_data"},
@@ -309,6 +315,168 @@ def refine_extraction(
             return block.input
 
     raise RuntimeError("Claude did not return refined chart data.")
+
+
+# ---------------------------------------------------------------------------
+# Automatic self-assessment and refinement
+# ---------------------------------------------------------------------------
+
+AUTO_REFINE_SYSTEM_PROMPT = """You are a chart data extraction quality assessor. You are given:
+
+1. The ORIGINAL chart image — this is the ground truth.
+2. An OVERLAY image — showing the current extracted data (colored lines) plotted on top of the original chart (faded background).
+
+Compare the colored extraction lines against the original chart curves in the background. Look for:
+- Curves that don't start or end at the correct values
+- Extracted lines that diverge significantly from the original curves
+- Missing steps in step-function curves (e.g. Kaplan-Meier survival curves)
+- Series that are confused or swapped
+- Regions where the extraction is noticeably above or below the original
+
+You also have the current extracted data as JSON.
+
+If the extraction looks accurate (lines closely follow the originals), return the data unchanged and note "Extraction looks accurate" in the notes field.
+
+If you see discrepancies, correct the data_series to better match the original chart. Return ALL data points for ALL series. In the notes field, briefly describe what you corrected.
+
+Call the store_refined_data tool with the (corrected or confirmed) data."""
+
+
+def _infer_axis_range(result: dict) -> dict | None:
+    """Infer axis_range from data_series min/max values."""
+    all_x, all_y = [], []
+    for series in result.get("data_series", []):
+        for pt in series.get("data", []):
+            if "x" in pt and "y" in pt:
+                all_x.append(pt["x"])
+                all_y.append(pt["y"])
+    if not all_x or not all_y:
+        return None
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    x_margin = (x_max - x_min) * 0.05 if x_max != x_min else 1.0
+    y_margin = (y_max - y_min) * 0.05 if y_max != y_min else 1.0
+    return {
+        "x_min": x_min - x_margin,
+        "x_max": x_max + x_margin,
+        "y_min": y_min - y_margin,
+        "y_max": y_max + y_margin,
+    }
+
+
+def auto_refine_extraction(
+    image_bytes: bytes,
+    mime_type: str,
+    result: dict,
+    max_rounds: int = 1,
+) -> dict:
+    """Generate an overlay and have Claude self-assess and correct the extraction.
+
+    After the initial extraction, this function:
+    1. Generates an overlay (extracted curves on top of the original chart)
+    2. Sends both images to Claude for comparison
+    3. Claude either confirms accuracy or returns corrected data
+
+    Args:
+        image_bytes: Original chart image bytes.
+        mime_type: MIME type of the original image.
+        result: Current extraction result dict.
+        max_rounds: Number of assess-and-correct rounds (default 1).
+
+    Returns:
+        Tuple-like dict: updated result with 'overlay_bytes' key added.
+    """
+    ar = result.get("axis_range") or _infer_axis_range(result)
+    if ar is None:
+        logger.info("Cannot auto-refine: no axis range available.")
+        return result
+
+    current = result
+    for round_num in range(max_rounds):
+        try:
+            overlay_bytes = generate_overlay(
+                image_bytes,
+                current["data_series"],
+                AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
+            )
+        except Exception as exc:
+            logger.warning("Overlay generation failed in auto-refine round %d: %s", round_num, exc)
+            break
+
+        client = anthropic.Anthropic()
+        b64_original = base64.standard_b64encode(image_bytes).decode("utf-8")
+        b64_overlay = base64.standard_b64encode(overlay_bytes).decode("utf-8")
+
+        current_data_json = json.dumps({
+            "chart_type": current.get("chart_type", ""),
+            "title": current.get("title", ""),
+            "x_label": current.get("x_label", ""),
+            "y_label": current.get("y_label", ""),
+            "data_series": current.get("data_series", []),
+        }, indent=2)
+
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=16384,
+            system=AUTO_REFINE_SYSTEM_PROMPT,
+            tools=[REFINEMENT_TOOL],
+            tool_choice={"type": "tool", "name": "store_refined_data"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here is the ORIGINAL chart image:"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": b64_original,
+                        },
+                    },
+                    {"type": "text", "text": "Here is the OVERLAY showing the current extraction (colored lines) over the original chart (faded background):"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": b64_overlay,
+                        },
+                    },
+                    {"type": "text", "text": f"Current extracted data:\n```json\n{current_data_json}\n```\n\nCompare the overlay against the original. If the extraction is inaccurate, correct it. If it looks good, return it unchanged."},
+                ],
+            }],
+        )
+
+        refined = None
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "store_refined_data":
+                refined = block.input
+                break
+
+        if refined is None:
+            logger.warning("Auto-refine round %d: no structured response.", round_num)
+            break
+
+        # Preserve metadata from original result
+        refined["extraction_method"] = current.get("extraction_method", "ai-only")
+        if current.get("axis_range"):
+            refined["axis_range"] = current["axis_range"]
+
+        logger.info("Auto-refine round %d: %s", round_num + 1, refined.get("notes", ""))
+        current = refined
+
+    # Store the final overlay bytes on the result
+    try:
+        final_overlay = generate_overlay(
+            image_bytes,
+            current["data_series"],
+            AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
+        )
+        current["_overlay_bytes"] = final_overlay
+    except Exception:
+        pass
+
+    return current
 
 
 # ---------------------------------------------------------------------------
