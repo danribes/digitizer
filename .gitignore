@@ -1,4 +1,36 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Environment / secrets
 .env
+.env.*
+
+# Test images and outputs
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# Scratch scripts
+extract_km.py
+extract_km_cv.py
+
+# Extracted data outputs
+*_extracted_data.json
