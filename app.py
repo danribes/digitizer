@@ -56,16 +56,22 @@ def _get_axis_range(result: dict) -> dict | None:
     if not all_x or not all_y:
         return None
 
-    # Add a small margin (5%) around the data range
     x_min, x_max = min(all_x), max(all_x)
     y_min, y_max = min(all_y), max(all_y)
-    x_margin = (x_max - x_min) * 0.05 if x_max != x_min else 1.0
-    y_margin = (y_max - y_min) * 0.05 if y_max != y_min else 1.0
+
+    # Snap to zero if minimum is close (within 10% of range)
+    x_range = x_max - x_min if x_max != x_min else 1.0
+    y_range = y_max - y_min if y_max != y_min else 1.0
+    if 0 <= x_min <= x_range * 0.1:
+        x_min = 0
+    if 0 <= y_min <= y_range * 0.1:
+        y_min = 0
+
     return {
-        "x_min": x_min - x_margin,
-        "x_max": x_max + x_margin,
-        "y_min": y_min - y_margin,
-        "y_max": y_max + y_margin,
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
     }
 
 

@@ -4,7 +4,13 @@ import logging
 
 import anthropic
 
-from pixel_tracer import AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay, snap_series_to_pixels
+from pixel_tracer import (
+    AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay,
+    snap_series_to_pixels, calibrate_axes, assess_extraction_accuracy,
+    detect_plot_bounds,
+)
+from PIL import Image
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +59,23 @@ EXTRACTION_TOOL = {
                     "required": ["name", "data"],
                 },
             },
+            "axis_range": {
+                "type": "object",
+                "description": "The numeric range of each axis as shown on the chart. Read the minimum and maximum values directly from the axis tick labels.",
+                "properties": {
+                    "x_min": {"type": "number", "description": "Minimum value on the x-axis."},
+                    "x_max": {"type": "number", "description": "Maximum value on the x-axis."},
+                    "y_min": {"type": "number", "description": "Minimum value on the y-axis."},
+                    "y_max": {"type": "number", "description": "Maximum value on the y-axis."},
+                },
+                "required": ["x_min", "x_max", "y_min", "y_max"],
+            },
             "notes": {
                 "type": "string",
                 "description": "Any caveats, uncertainties, or notes about the extraction.",
             },
         },
-        "required": ["chart_type", "title", "x_label", "y_label", "data_series", "notes"],
+        "required": ["chart_type", "title", "x_label", "y_label", "data_series", "axis_range", "notes"],
     },
 }
 
@@ -143,6 +160,7 @@ Instructions:
 - For ternary charts, return data as {\"a\": ..., \"b\": ..., \"c\": ...} objects.
 - Read values from axes/gridlines as precisely as possible. Use numeric values where the axis is numeric.
 - If a series name is not shown in a legend, infer a reasonable name (e.g. "Series 1").
+- Extract the axis range: read the minimum and maximum values from each axis's tick labels.
 - Note any uncertainties in the notes field.
 
 Accuracy guidelines:
@@ -346,7 +364,12 @@ Call the store_refined_data tool with the corrected data."""
 
 
 def _infer_axis_range(result: dict) -> dict | None:
-    """Infer axis_range from data_series min/max values."""
+    """Infer axis_range from data_series min/max values.
+
+    Uses the exact data bounds without artificial margins, since the axis
+    range should match the chart's actual axes.  If the minimum is close
+    to zero, snaps to zero.
+    """
     all_x, all_y = [], []
     for series in result.get("data_series", []):
         for pt in series.get("data", []):
@@ -357,13 +380,20 @@ def _infer_axis_range(result: dict) -> dict | None:
         return None
     x_min, x_max = min(all_x), max(all_x)
     y_min, y_max = min(all_y), max(all_y)
-    x_margin = (x_max - x_min) * 0.05 if x_max != x_min else 1.0
-    y_margin = (y_max - y_min) * 0.05 if y_max != y_min else 1.0
+
+    # Snap to zero if the minimum is close (within 10% of the range)
+    x_range = x_max - x_min if x_max != x_min else 1.0
+    y_range = y_max - y_min if y_max != y_min else 1.0
+    if 0 <= x_min <= x_range * 0.1:
+        x_min = 0
+    if 0 <= y_min <= y_range * 0.1:
+        y_min = 0
+
     return {
-        "x_min": x_min - x_margin,
-        "x_max": x_max + x_margin,
-        "y_min": y_min - y_margin,
-        "y_max": y_max + y_margin,
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
     }
 
 
@@ -373,29 +403,56 @@ def auto_refine_extraction(
     result: dict,
     max_rounds: int = 2,
 ) -> dict:
-    """Generate an overlay and have Claude self-assess and correct the extraction.
+    """Two-phase extraction refinement: axis calibration then accuracy-driven AI correction.
 
-    After the initial extraction, this function:
-    1. Generates an overlay (extracted curves on top of the original chart)
-    2. Sends both images to Claude for comparison
-    3. Claude either confirms accuracy or returns corrected data
+    Phase 1 — Axis calibration (CV):
+        Detect plot bounds and tick marks, verify the pixel-to-data mapping,
+        report alignment quality.  Then pixel-snap extracted points to actual
+        curve pixels using the calibrated mapping.
+
+    Phase 2 — Extraction accuracy assessment + AI correction:
+        Measure per-series extraction error with CV.  If accuracy is below
+        threshold, send specific quantitative error feedback to Claude for
+        targeted correction.  Re-assess after each AI round.
 
     Args:
         image_bytes: Original chart image bytes.
         mime_type: MIME type of the original image.
-        result: Current extraction result dict.
-        max_rounds: Number of assess-and-correct rounds (default 1).
+        result: Current extraction result dict (from initial AI extraction).
+        max_rounds: Max AI correction rounds (default 2).
 
     Returns:
-        Tuple-like dict: updated result with 'overlay_bytes' key added.
+        Updated result dict with ``_overlay_bytes``, ``_calibration``, and
+        ``_accuracy`` keys added.
     """
+    import io as _io
+
     ar = result.get("axis_range") or _infer_axis_range(result)
     if ar is None:
         logger.info("Cannot auto-refine: no axis range available.")
         return result
 
-    # Step 1: Pixel-snap correction — use actual curve pixels to fix y-values
     axis = AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"])
+    img = np.array(Image.open(_io.BytesIO(image_bytes)).convert("RGB"))
+    bounds = detect_plot_bounds(img)
+    if bounds is None or bounds.height < 20:
+        logger.warning("Cannot auto-refine: plot bounds detection failed.")
+        return result
+
+    # =================================================================
+    # PHASE 1: Axis calibration + alignment assessment
+    # =================================================================
+    calibration = calibrate_axes(img, bounds, axis)
+    logger.info(
+        "Phase 1 — Axis calibration: quality=%s, x_ticks=%d, y_ticks=%d",
+        calibration["alignment_quality"],
+        len(calibration["x_tick_cols"]),
+        len(calibration["y_tick_rows"]),
+    )
+    for k, v in calibration["metrics"].items():
+        logger.info("  %s: %s", k, v)
+
+    # Pixel-snap correction using the calibrated axis mapping
     try:
         snapped = snap_series_to_pixels(image_bytes, result["data_series"], axis)
         result = {**result, "data_series": snapped}
@@ -403,18 +460,47 @@ def auto_refine_extraction(
     except Exception as exc:
         logger.warning("Pixel-snap failed: %s", exc)
 
-    # Step 2: AI assessment rounds — Claude checks overlay and fine-tunes
+    # Initial accuracy assessment after pixel-snap
+    accuracy = assess_extraction_accuracy(img, result["data_series"], bounds, axis)
+    logger.info(
+        "Phase 1 — Post-snap accuracy: MAE=%.4f, within_3%%=%.1f%%, pass=%s",
+        accuracy["overall_mae"],
+        accuracy["overall_within_3pct"] * 100,
+        accuracy["passed"],
+    )
+
+    # =================================================================
+    # PHASE 2: AI correction rounds driven by CV accuracy feedback
+    # =================================================================
     current = result
     for round_num in range(max_rounds):
+        if accuracy["passed"]:
+            logger.info("Phase 2 — Accuracy passed, skipping AI round %d.", round_num + 1)
+            break
+
         try:
             overlay_bytes = generate_overlay(
                 image_bytes,
                 current["data_series"],
-                AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
+                axis,
             )
         except Exception as exc:
-            logger.warning("Overlay generation failed in auto-refine round %d: %s", round_num, exc)
+            logger.warning("Overlay generation failed in round %d: %s", round_num, exc)
             break
+
+        # Build targeted correction prompt using CV feedback
+        cv_feedback = accuracy.get("feedback_text", "")
+        correction_prompt = (
+            "Compare the overlay against the original. "
+            "The computer-vision accuracy assessment found these specific errors:\n\n"
+            f"{cv_feedback}\n\n"
+            "Please correct the data_series to fix these errors. "
+            "Re-read y-values from the ORIGINAL chart at the problem regions. "
+            "Return ALL data points for ALL series."
+            if cv_feedback else
+            "Compare the overlay against the original. If the extraction is "
+            "inaccurate, correct it. If it looks good, return it unchanged."
+        )
 
         client = anthropic.Anthropic()
         b64_original = base64.standard_b64encode(image_bytes).decode("utf-8")
@@ -455,7 +541,10 @@ def auto_refine_extraction(
                             "data": b64_overlay,
                         },
                     },
-                    {"type": "text", "text": f"Current extracted data:\n```json\n{current_data_json}\n```\n\nCompare the overlay against the original. If the extraction is inaccurate, correct it. If it looks good, return it unchanged."},
+                    {
+                        "type": "text",
+                        "text": f"Current extracted data:\n```json\n{current_data_json}\n```\n\n{correction_prompt}",
+                    },
                 ],
             }],
         )
@@ -467,7 +556,7 @@ def auto_refine_extraction(
                 break
 
         if refined is None:
-            logger.warning("Auto-refine round %d: no structured response.", round_num)
+            logger.warning("AI round %d: no structured response.", round_num + 1)
             break
 
         # Preserve metadata from original result
@@ -475,16 +564,26 @@ def auto_refine_extraction(
         if current.get("axis_range"):
             refined["axis_range"] = current["axis_range"]
 
-        logger.info("Auto-refine round %d: %s", round_num + 1, refined.get("notes", ""))
+        logger.info("AI round %d notes: %s", round_num + 1, refined.get("notes", ""))
         current = refined
 
-    # Store the final overlay bytes on the result
-    try:
-        final_overlay = generate_overlay(
-            image_bytes,
-            current["data_series"],
-            AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"]),
+        # Re-assess accuracy after AI correction
+        accuracy = assess_extraction_accuracy(img, current["data_series"], bounds, axis)
+        logger.info(
+            "Phase 2 — Round %d accuracy: MAE=%.4f, within_3%%=%.1f%%, pass=%s",
+            round_num + 1,
+            accuracy["overall_mae"],
+            accuracy["overall_within_3pct"] * 100,
+            accuracy["passed"],
         )
+
+    # Store diagnostics on the result
+    current["_calibration"] = calibration
+    current["_accuracy"] = accuracy
+
+    # Generate final overlay
+    try:
+        final_overlay = generate_overlay(image_bytes, current["data_series"], axis)
         current["_overlay_bytes"] = final_overlay
     except Exception:
         pass

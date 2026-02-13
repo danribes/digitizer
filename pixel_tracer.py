@@ -228,6 +228,259 @@ def detect_plot_bounds(img: np.ndarray, min_run: int = 150) -> PlotBounds | None
     )
 
 
+def _cluster_positions(positions: list[int], min_gap: int = 8) -> list[int]:
+    """Cluster nearby pixel positions and return their centers."""
+    if not positions:
+        return []
+    positions = sorted(positions)
+    clusters: list[list[int]] = [[positions[0]]]
+    for p in positions[1:]:
+        if p - clusters[-1][-1] <= min_gap:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    return [int(np.mean(c)) for c in clusters]
+
+
+def detect_axis_ticks(
+    img: np.ndarray, bounds: PlotBounds,
+) -> tuple[list[int], list[int]]:
+    """Detect tick mark positions on x-axis and y-axis using CV.
+
+    X-axis ticks: short vertical dark marks just below the x-axis line.
+    Y-axis ticks: short horizontal dark marks just left of the y-axis line.
+
+    Returns:
+        (x_tick_cols, y_tick_rows) — sorted lists of pixel positions.
+    """
+    gray = img.mean(axis=2)
+    h, w = gray.shape
+
+    # --- X-axis ticks: vertical marks below x-axis ---
+    x_cands: list[int] = []
+    tick_top = bounds.bottom + 1
+    tick_bot = min(h - 1, bounds.bottom + 6)
+    for col in range(bounds.left, min(w, bounds.right + 5)):
+        dark_count = sum(1 for r in range(tick_top, tick_bot + 1)
+                         if r < h and gray[r, col] < 140)
+        if dark_count >= 2:
+            x_cands.append(col)
+    x_tick_cols = _cluster_positions(x_cands, min_gap=8)
+    # Exclude the y-axis position itself
+    x_tick_cols = [c for c in x_tick_cols if abs(c - bounds.left) > 3]
+
+    # --- Y-axis ticks: horizontal marks left of y-axis ---
+    y_cands: list[int] = []
+    tick_left = max(0, bounds.left - 6)
+    tick_right = bounds.left - 1
+    for row in range(bounds.top, bounds.bottom + 1):
+        dark_count = sum(1 for c in range(tick_left, tick_right + 1)
+                         if c >= 0 and gray[row, c] < 140)
+        if dark_count >= 2:
+            y_cands.append(row)
+    y_tick_rows = _cluster_positions(y_cands, min_gap=8)
+
+    return x_tick_cols, y_tick_rows
+
+
+def calibrate_axes(
+    img: np.ndarray,
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+) -> dict:
+    """Calibrate axes using CV tick detection and assess alignment quality.
+
+    Detects tick marks, verifies their spacing is regular (linear axis),
+    and checks that the bounds correctly represent the axis range.
+
+    Returns dict with:
+        x_tick_cols, y_tick_rows: detected tick positions
+        alignment_quality: overall quality assessment string
+        metrics: detailed alignment metrics
+    """
+    x_tick_cols, y_tick_rows = detect_axis_ticks(img, bounds)
+
+    metrics: dict = {
+        "x_tick_count": len(x_tick_cols),
+        "y_tick_count": len(y_tick_rows),
+    }
+
+    # --- X-axis tick regularity ---
+    x_regularity = 1.0
+    if len(x_tick_cols) >= 2:
+        intervals = np.diff(x_tick_cols).astype(float)
+        mean_int = np.mean(intervals)
+        rmse = float(np.sqrt(np.mean((intervals - mean_int) ** 2)))
+        x_regularity = max(0.0, 1.0 - rmse / mean_int) if mean_int > 0 else 0
+        metrics["x_tick_interval_mean_px"] = round(float(mean_int), 1)
+        metrics["x_tick_interval_rmse_px"] = round(rmse, 2)
+        metrics["x_tick_regularity"] = round(x_regularity, 4)
+
+        # Check first tick aligns with bounds.left (x_min)
+        first_offset = abs(x_tick_cols[0] - bounds.left)
+        metrics["x_first_tick_offset_px"] = first_offset
+
+    # --- Y-axis tick regularity ---
+    y_regularity = 1.0
+    if len(y_tick_rows) >= 2:
+        intervals = np.diff(y_tick_rows).astype(float)
+        mean_int = np.mean(intervals)
+        rmse = float(np.sqrt(np.mean((intervals - mean_int) ** 2)))
+        y_regularity = max(0.0, 1.0 - rmse / mean_int) if mean_int > 0 else 0
+        metrics["y_tick_interval_mean_px"] = round(float(mean_int), 1)
+        metrics["y_tick_interval_rmse_px"] = round(rmse, 2)
+        metrics["y_tick_regularity"] = round(y_regularity, 4)
+
+        first_offset = abs(y_tick_rows[0] - bounds.top)
+        metrics["y_first_tick_offset_px"] = first_offset
+
+    # --- Alignment quality verdict ---
+    if x_regularity > 0.95 and y_regularity > 0.95:
+        quality = "good"
+    elif x_regularity > 0.85 and y_regularity > 0.85:
+        quality = "acceptable"
+    else:
+        quality = "poor"
+
+    return {
+        "x_tick_cols": x_tick_cols,
+        "y_tick_rows": y_tick_rows,
+        "alignment_quality": quality,
+        "metrics": metrics,
+    }
+
+
+def assess_extraction_accuracy(
+    img: np.ndarray,
+    data_series: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+    search_radius: int = 30,
+) -> dict:
+    """CV-based extraction accuracy assessment.
+
+    For each extracted data point, finds the nearest dark curve pixel
+    vertically and measures the discrepancy.
+
+    Returns dict with per-series metrics, overall metrics, and
+    a feedback_text string describing specific errors for AI correction.
+    """
+    gray = img.mean(axis=2)
+
+    # Build dark-pixel mask for curve pixels only
+    dark = gray < 160
+    brightness = img[:, :, 0].astype(int) + img[:, :, 1].astype(int) + img[:, :, 2].astype(int)
+    dark = dark & (brightness < 680)
+
+    # Exclude axis lines
+    axis_margin = 4
+    for r in range(max(0, bounds.bottom - axis_margin),
+                   min(img.shape[0], bounds.bottom + axis_margin + 1)):
+        dark[r, :] = False
+    for c in range(max(0, bounds.left - axis_margin),
+                   min(img.shape[1], bounds.left + axis_margin + 1)):
+        dark[:, c] = False
+
+    y_full_scale = axis_range.y_max - axis_range.y_min
+
+    series_results = []
+    all_errors: list[float] = []
+
+    for series in data_series:
+        name = series.get("name", "?")
+        pts = series.get("data", [])
+        errors: list[float] = []
+        point_details: list[dict] = []
+        missed = 0
+
+        for pt in pts:
+            if "x" not in pt or "y" not in pt:
+                continue
+            x, y = float(pt["x"]), float(pt["y"])
+            col, row_expected = _data_to_pixel(x, y, bounds, axis_range)
+            if col <= bounds.left + 5 or col >= bounds.right - 2:
+                continue
+
+            # Find nearest dark pixel vertically
+            col_lo = max(bounds.left, col - 2)
+            col_hi = min(bounds.right, col + 2)
+            actual_row = None
+            for dist in range(search_radius + 1):
+                for dr in ([0] if dist == 0 else [-dist, dist]):
+                    r = row_expected + dr
+                    if bounds.top <= r <= bounds.bottom and dark[r, col_lo:col_hi + 1].any():
+                        actual_row = r
+                        break
+                if actual_row is not None:
+                    break
+
+            if actual_row is None:
+                missed += 1
+                continue
+
+            _, actual_y = pixel_to_data(col, actual_row, bounds, axis_range)
+            error = y - actual_y
+            errors.append(error)
+            all_errors.append(error)
+            point_details.append({"x": x, "y_extracted": y, "y_actual": round(actual_y, 4), "error": round(error, 4)})
+
+        err_arr = np.array(errors) if errors else np.array([0.0])
+
+        # Identify systematic error regions
+        region_errors: list[str] = []
+        if len(point_details) >= 5:
+            # Split into 5 regions along x-axis
+            xs = [p["x"] for p in point_details]
+            x_lo, x_hi = min(xs), max(xs)
+            n_regions = 5
+            for ri in range(n_regions):
+                rx_lo = x_lo + ri * (x_hi - x_lo) / n_regions
+                rx_hi = x_lo + (ri + 1) * (x_hi - x_lo) / n_regions
+                region_pts = [p for p in point_details if rx_lo <= p["x"] < rx_hi]
+                if len(region_pts) >= 2:
+                    region_bias = np.mean([p["error"] for p in region_pts])
+                    if abs(region_bias) > 0.015 * y_full_scale:
+                        direction = "too high" if region_bias > 0 else "too low"
+                        region_errors.append(
+                            f"x={rx_lo:.1f}-{rx_hi:.1f}: extracted is {abs(region_bias):.3f} {direction}"
+                        )
+
+        sr = {
+            "name": name,
+            "n_points": len(errors),
+            "missed": missed,
+            "mae": round(float(np.mean(np.abs(err_arr))), 4),
+            "rmse": round(float(np.sqrt(np.mean(err_arr ** 2))), 4),
+            "bias": round(float(np.mean(err_arr)), 4),
+            "max_error": round(float(np.max(np.abs(err_arr))), 4),
+            "within_3pct": round(float(np.mean(np.abs(err_arr) <= 0.03 * y_full_scale)), 4),
+            "region_errors": region_errors,
+        }
+        series_results.append(sr)
+
+    all_err = np.array(all_errors) if all_errors else np.array([0.0])
+    overall_mae = float(np.mean(np.abs(all_err)))
+    overall_within_3 = float(np.mean(np.abs(all_err) <= 0.03 * y_full_scale))
+
+    # Generate targeted feedback text for AI correction
+    feedback_lines = []
+    for sr in series_results:
+        if sr["mae"] > 0.02 * y_full_scale or sr["within_3pct"] < 0.85:
+            feedback_lines.append(f"Series '{sr['name']}' has MAE={sr['mae']:.4f} (bias={sr['bias']:+.4f}).")
+            for re in sr["region_errors"]:
+                feedback_lines.append(f"  {re}")
+
+    passed = overall_mae <= 0.02 * y_full_scale and overall_within_3 >= 0.90
+
+    return {
+        "series": series_results,
+        "overall_mae": round(overall_mae, 4),
+        "overall_within_3pct": round(overall_within_3, 4),
+        "passed": passed,
+        "feedback_text": "\n".join(feedback_lines) if feedback_lines else "",
+    }
+
+
 def pixel_to_data(
     col: float, row: float, bounds: PlotBounds, axis_range: AxisRange
 ) -> tuple[float, float]:
