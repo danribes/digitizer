@@ -350,6 +350,40 @@ def calibrate_axes(
     }
 
 
+def _build_curve_mask(img: np.ndarray, bounds: PlotBounds) -> np.ndarray:
+    """Build a binary mask of curve pixels, excluding axes and censoring marks.
+
+    Censoring marks (crosses/ticks on Kaplan-Meier curves) are short
+    perpendicular marks typically 1-2 pixels wide.  A morphological
+    opening with a horizontal structuring element removes them while
+    preserving the main curve lines.
+    """
+    from scipy.ndimage import binary_opening
+
+    gray = img.mean(axis=2)
+    dark = gray < 160
+    brightness = (img[:, :, 0].astype(int)
+                  + img[:, :, 1].astype(int)
+                  + img[:, :, 2].astype(int))
+    dark = dark & (brightness < 680)
+
+    # Exclude axis lines by position
+    axis_margin = 4
+    for r in range(max(0, bounds.bottom - axis_margin),
+                   min(img.shape[0], bounds.bottom + axis_margin + 1)):
+        dark[r, :] = False
+    for c in range(max(0, bounds.left - axis_margin),
+                   min(img.shape[1], bounds.left + axis_margin + 1)):
+        dark[:, c] = False
+
+    # Remove censoring marks: opening with horizontal kernel removes
+    # features narrower than 3 px (crosses are 1-2 px wide).
+    h_kernel = np.ones((1, 3), dtype=bool)
+    dark = binary_opening(dark, structure=h_kernel)
+
+    return dark
+
+
 def assess_extraction_accuracy(
     img: np.ndarray,
     data_series: list[dict],
@@ -365,21 +399,7 @@ def assess_extraction_accuracy(
     Returns dict with per-series metrics, overall metrics, and
     a feedback_text string describing specific errors for AI correction.
     """
-    gray = img.mean(axis=2)
-
-    # Build dark-pixel mask for curve pixels only
-    dark = gray < 160
-    brightness = img[:, :, 0].astype(int) + img[:, :, 1].astype(int) + img[:, :, 2].astype(int)
-    dark = dark & (brightness < 680)
-
-    # Exclude axis lines
-    axis_margin = 4
-    for r in range(max(0, bounds.bottom - axis_margin),
-                   min(img.shape[0], bounds.bottom + axis_margin + 1)):
-        dark[r, :] = False
-    for c in range(max(0, bounds.left - axis_margin),
-                   min(img.shape[1], bounds.left + axis_margin + 1)):
-        dark[:, c] = False
+    dark = _build_curve_mask(img, bounds)
 
     y_full_scale = axis_range.y_max - axis_range.y_min
 
@@ -1125,22 +1145,7 @@ def snap_series_to_pixels(
     if bounds is None or bounds.height < 20:
         return data_series
 
-    gray = img.mean(axis=2)
-
-    # Build dark-pixel mask: curve pixels but not background, and exclude
-    # axis lines by position.
-    dark = gray < 160
-    # Exclude near-white
-    brightness = img[:, :, 0].astype(int) + img[:, :, 1].astype(int) + img[:, :, 2].astype(int)
-    dark = dark & (brightness < 680)
-    # Exclude axis lines by position
-    axis_margin = 4
-    for r in range(max(0, bounds.bottom - axis_margin),
-                   min(img.shape[0], bounds.bottom + axis_margin + 1)):
-        dark[r, :] = False
-    for c in range(max(0, bounds.left - axis_margin),
-                   min(img.shape[1], bounds.left + axis_margin + 1)):
-        dark[:, c] = False
+    dark = _build_curve_mask(img, bounds)
 
     # For each column, find all dark-pixel segments (contiguous vertical runs)
     # so we can snap to segment centers rather than individual pixels.
