@@ -603,6 +603,7 @@ def auto_refine_extraction(
     # Skip AI calibration when bounds are manually provided (user already calibrated)
     is_bw: bool | None = None
     series_info: list | None = None
+    ai_cal: dict | None = None
     if bounds_override is not None:
         logger.info("Manual calibration provided, skipping AI calibration assessment.")
     else:
