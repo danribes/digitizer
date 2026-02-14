@@ -38,11 +38,6 @@ extraction_method = st.sidebar.radio(
     "Extraction method",
     ["AI-only", "Pixel-enhanced (hybrid)"],
 )
-manual_calibration = st.sidebar.checkbox(
-    "Manual calibration",
-    help="Click two points on the chart to define the plot area and axis ranges, "
-         "bypassing automated axis detection.",
-)
 
 # Upload
 uploaded = st.file_uploader("Upload a chart image", type=SUPPORTED_TYPES)
@@ -153,95 +148,75 @@ def _normalize_image(raw_bytes: bytes, reported_mime: str | None) -> tuple[bytes
 if uploaded is not None:
     image_bytes, mime_type = _normalize_image(uploaded.getvalue(), uploaded.type)
 
-    # --- Manual calibration UI ---
-    if manual_calibration:
-        st.subheader("Manual Calibration")
-        st.markdown(
-            "Click **Point 1** (top-left of plot area) and **Point 2** "
-            "(bottom-right of plot area) on the image below, then enter "
-            "their data coordinates."
-        )
+    # --- Calibration: user must click the (0, 1.0) origin ---
+    st.subheader("Calibration")
+    st.markdown(
+        "Click on the chart where the **origin (0, 1.0)** is located "
+        "(top-left corner of the plot area) and enter the maximum X-axis value."
+    )
 
-        # Determine original image dimensions for coordinate scaling
-        pil_img = Image.open(uploaded)
-        orig_w, orig_h = pil_img.size
-        uploaded.seek(0)  # reset after PIL read
+    # Determine original image dimensions for coordinate scaling
+    pil_img = Image.open(uploaded)
+    orig_w, orig_h = pil_img.size
+    uploaded.seek(0)  # reset after PIL read
 
-        # Render at a fixed display width so we can compute the scale factor.
-        # The component returns click coords relative to the displayed size.
-        display_w = min(orig_w, 700)
-        scale = orig_w / display_w
+    # Render at a fixed display width so we can compute the scale factor.
+    display_w = min(orig_w, 700)
+    scale = orig_w / display_w
 
-        # Let user pick which point to capture
-        cal_point_sel = st.radio(
-            "Capture point",
-            ["Point 1 (top-left)", "Point 2 (bottom-right)"],
-            horizontal=True,
-            key="cal_point_sel",
-        )
+    # Show clickable image
+    coords = streamlit_image_coordinates(
+        pil_img, width=display_w, key="cal_image", cursor="crosshair",
+    )
 
-        # Show clickable image
-        coords = streamlit_image_coordinates(
-            pil_img, width=display_w, key="cal_image", cursor="crosshair",
-        )
+    # Process click — only act on NEW clicks, not replayed values.
+    if coords is not None:
+        click_key = (coords["x"], coords["y"])
+        if click_key != st.session_state.get("_last_cal_click"):
+            st.session_state["_last_cal_click"] = click_key
+            px_col = int(coords["x"] * scale)
+            px_row = int(coords["y"] * scale)
+            st.session_state["cal_origin_pixel"] = (px_col, px_row)
 
-        # Process click — only act on NEW clicks, not replayed values.
-        # streamlit_image_coordinates returns the last click on every rerun,
-        # so switching the radio would re-assign the old click to the wrong point.
-        if coords is not None:
-            click_key = (coords["x"], coords["y"])
-            if click_key != st.session_state.get("_last_cal_click"):
-                st.session_state["_last_cal_click"] = click_key
-                px_col = int(coords["x"] * scale)
-                px_row = int(coords["y"] * scale)
-
-                if cal_point_sel == "Point 1 (top-left)":
-                    st.session_state["cal_pixel_1"] = (px_col, px_row)
-                else:
-                    st.session_state["cal_pixel_2"] = (px_col, px_row)
-
-        # Data coordinate inputs for both points
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            st.markdown("**Point 1 (top-left)**")
-            p1_px = st.session_state.get("cal_pixel_1")
-            if p1_px:
-                st.caption(f"Pixel: ({p1_px[0]}, {p1_px[1]})")
-            else:
-                st.caption("Click on image to set")
-            p1_x = st.number_input("Point 1 X", value=0.0, key="cal_p1_x")
-            p1_y = st.number_input("Point 1 Y", value=1.0, key="cal_p1_y")
-        with col_p2:
-            st.markdown("**Point 2 (bottom-right)**")
-            p2_px = st.session_state.get("cal_pixel_2")
-            if p2_px:
-                st.caption(f"Pixel: ({p2_px[0]}, {p2_px[1]})")
-            else:
-                st.caption("Click on image to set")
-            p2_x = st.number_input("Point 2 X", value=5.0, key="cal_p2_x")
-            p2_y = st.number_input("Point 2 Y", value=0.0, key="cal_p2_y")
-
-        # Build calibration_points if both pixel positions are set
-        if p1_px and p2_px:
-            st.session_state["calibration_points"] = {
-                "pixel_1": p1_px,
-                "data_1": (p1_x, p1_y),
-                "pixel_2": p2_px,
-                "data_2": (p2_x, p2_y),
-            }
-            st.success(
-                f"Calibration set: Point 1 ({p1_px[0]}, {p1_px[1]}) = ({p1_x}, {p1_y}), "
-                f"Point 2 ({p2_px[0]}, {p2_px[1]}) = ({p2_x}, {p2_y})"
-            )
-        else:
-            st.session_state.pop("calibration_points", None)
-            st.info("Click on the image to set both calibration points.")
+    origin_px = st.session_state.get("cal_origin_pixel")
+    if origin_px:
+        st.caption(f"Origin pixel: ({origin_px[0]}, {origin_px[1]})")
     else:
-        # Clear calibration state when toggle is off
-        for key in ("cal_pixel_1", "cal_pixel_2", "calibration_points", "_last_cal_click"):
-            st.session_state.pop(key, None)
+        st.info("Click on the (0, 1.0) point on the chart above.")
 
-    if st.button("Extract Data", type="primary"):
+    x_max_val = st.number_input(
+        "Maximum X-axis value", value=5.0, min_value=0.01, key="cal_x_max",
+    )
+
+    # Build calibration_points when origin is set.
+    # The origin click gives us the top-left pixel (data = 0, 1.0).
+    # Auto-detect the bottom-right pixel from the image.
+    if origin_px:
+        import io as _io
+        import numpy as np
+        from pixel_tracer import detect_plot_bounds
+        img_arr = np.array(Image.open(_io.BytesIO(image_bytes)).convert("RGB"))
+        auto_bounds = detect_plot_bounds(img_arr)
+        if auto_bounds:
+            bottom_right = (auto_bounds.right, auto_bounds.bottom)
+        else:
+            # Fallback: estimate bottom-right from image dimensions
+            bottom_right = (int(orig_w * 0.90), int(orig_h * 0.85))
+
+        st.session_state["calibration_points"] = {
+            "pixel_1": origin_px,
+            "data_1": (0.0, 1.0),
+            "pixel_2": bottom_right,
+            "data_2": (x_max_val, 0.0),
+        }
+        st.success(
+            f"Origin (0, 1.0) at pixel ({origin_px[0]}, {origin_px[1]}), "
+            f"X-axis range: 0 – {x_max_val}"
+        )
+
+    cal_pts = st.session_state.get("calibration_points")
+    extract_disabled = origin_px is None
+    if st.button("Extract Data", type="primary", disabled=extract_disabled):
         # Clear chat state on new extraction
         st.session_state.pop("chat_messages", None)
         st.session_state.pop("overlay_bytes", None)
@@ -251,7 +226,6 @@ if uploaded is not None:
 
         hint = chart_type_hint if chart_type_hint != "Auto-detect" else None
         use_hybrid = extraction_method == "Pixel-enhanced (hybrid)"
-        cal_pts = st.session_state.get("calibration_points")
         spinner_text = (
             "Analyzing chart with Claude Vision + pixel tracing..."
             if use_hybrid
@@ -296,19 +270,15 @@ if uploaded is not None:
                 except Exception:
                     pass  # Auto-refine is best-effort; keep original result
 
-            # When manual calibration is active, ensure all series start at
-            # the Point 1 data coordinates (e.g. (0, 1.0) for KM curves).
+            # Ensure all series start at (0, 1.0) — the calibrated origin.
             # The pixel tracer may not trace all the way to the axis origin.
-            if cal_pts:
-                start_x = min(cal_pts["data_1"][0], cal_pts["data_2"][0])
-                start_y = max(cal_pts["data_1"][1], cal_pts["data_2"][1])
-                for series in result.get("data_series", []):
-                    pts = series.get("data", [])
-                    if not pts:
-                        continue
-                    first = pts[0]
-                    if abs(first.get("x", start_x) - start_x) > 1e-9 or abs(first.get("y", start_y) - start_y) > 1e-9:
-                        series["data"] = [{"x": start_x, "y": start_y}] + pts
+            for series in result.get("data_series", []):
+                pts = series.get("data", [])
+                if not pts:
+                    continue
+                first = pts[0]
+                if abs(first.get("x", 0) - 0) > 1e-9 or abs(first.get("y", 1) - 1.0) > 1e-9:
+                    series["data"] = [{"x": 0.0, "y": 1.0}] + pts
 
             st.session_state["result"] = result
             st.session_state["image_bytes"] = image_bytes
