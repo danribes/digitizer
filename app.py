@@ -124,9 +124,34 @@ def _save_overlay(overlay_bytes: bytes) -> None:
     (OVERLAYS_DIR / save_name).write_bytes(overlay_bytes)
 
 
+def _normalize_image(raw_bytes: bytes, reported_mime: str | None) -> tuple[bytes, str]:
+    """Re-encode image to PNG if the format isn't natively supported by the API,
+    or if the reported MIME type doesn't match the actual file contents."""
+    import io as _io
+    try:
+        img = Image.open(_io.BytesIO(raw_bytes))
+        fmt = (img.format or "").upper()
+    except Exception:
+        return raw_bytes, reported_mime or "image/png"
+
+    # Map PIL format names to MIME types
+    fmt_to_mime = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp", "GIF": "image/gif"}
+    actual_mime = fmt_to_mime.get(fmt)
+
+    # Re-encode to PNG if: format unsupported by API (GIF), or MIME mismatch
+    needs_reencode = fmt not in ("PNG", "JPEG", "WEBP") or (
+        reported_mime and actual_mime and reported_mime != actual_mime
+    )
+    if needs_reencode:
+        buf = _io.BytesIO()
+        img.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+
+    return raw_bytes, actual_mime or reported_mime or "image/png"
+
+
 if uploaded is not None:
-    image_bytes = uploaded.getvalue()
-    mime_type = uploaded.type or "image/png"
+    image_bytes, mime_type = _normalize_image(uploaded.getvalue(), uploaded.type)
 
     # --- Manual calibration UI ---
     if manual_calibration:
@@ -160,15 +185,20 @@ if uploaded is not None:
             pil_img, width=display_w, key="cal_image", cursor="crosshair",
         )
 
-        # Process click
+        # Process click — only act on NEW clicks, not replayed values.
+        # streamlit_image_coordinates returns the last click on every rerun,
+        # so switching the radio would re-assign the old click to the wrong point.
         if coords is not None:
-            px_col = int(coords["x"] * scale)
-            px_row = int(coords["y"] * scale)
+            click_key = (coords["x"], coords["y"])
+            if click_key != st.session_state.get("_last_cal_click"):
+                st.session_state["_last_cal_click"] = click_key
+                px_col = int(coords["x"] * scale)
+                px_row = int(coords["y"] * scale)
 
-            if cal_point_sel == "Point 1 (top-left)":
-                st.session_state["cal_pixel_1"] = (px_col, px_row)
-            else:
-                st.session_state["cal_pixel_2"] = (px_col, px_row)
+                if cal_point_sel == "Point 1 (top-left)":
+                    st.session_state["cal_pixel_1"] = (px_col, px_row)
+                else:
+                    st.session_state["cal_pixel_2"] = (px_col, px_row)
 
         # Data coordinate inputs for both points
         col_p1, col_p2 = st.columns(2)
@@ -208,7 +238,7 @@ if uploaded is not None:
             st.info("Click on the image to set both calibration points.")
     else:
         # Clear calibration state when toggle is off
-        for key in ("cal_pixel_1", "cal_pixel_2", "calibration_points"):
+        for key in ("cal_pixel_1", "cal_pixel_2", "calibration_points", "_last_cal_click"):
             st.session_state.pop(key, None)
 
     if st.button("Extract Data", type="primary"):
@@ -265,6 +295,20 @@ if uploaded is not None:
                         st.session_state["overlay_version"] = 0
                 except Exception:
                     pass  # Auto-refine is best-effort; keep original result
+
+            # When manual calibration is active, ensure all series start at
+            # the Point 1 data coordinates (e.g. (0, 1.0) for KM curves).
+            # The pixel tracer may not trace all the way to the axis origin.
+            if cal_pts:
+                start_x = min(cal_pts["data_1"][0], cal_pts["data_2"][0])
+                start_y = max(cal_pts["data_1"][1], cal_pts["data_2"][1])
+                for series in result.get("data_series", []):
+                    pts = series.get("data", [])
+                    if not pts:
+                        continue
+                    first = pts[0]
+                    if abs(first.get("x", start_x) - start_x) > 1e-9 or abs(first.get("y", start_y) - start_y) > 1e-9:
+                        series["data"] = [{"x": start_x, "y": start_y}] + pts
 
             st.session_state["result"] = result
             st.session_state["image_bytes"] = image_bytes
