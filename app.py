@@ -3,10 +3,12 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 from extractor import extract_chart_data, extract_chart_data_hybrid, refine_extraction, auto_refine_extraction
 from export import to_csv, to_json, to_excel, to_python, _build_combined_df
-from pixel_tracer import AxisRange, generate_overlay
+from pixel_tracer import AxisRange, PlotBounds, generate_overlay
 
 OVERLAYS_DIR = Path(__file__).parent / "overlays"
 OVERLAYS_DIR.mkdir(exist_ok=True)
@@ -35,6 +37,11 @@ chart_type_hint = st.sidebar.selectbox("Chart type hint", CHART_TYPES)
 extraction_method = st.sidebar.radio(
     "Extraction method",
     ["AI-only", "Pixel-enhanced (hybrid)"],
+)
+manual_calibration = st.sidebar.checkbox(
+    "Manual calibration",
+    help="Click two points on the chart to define the plot area and axis ranges, "
+         "bypassing automated axis detection.",
 )
 
 # Upload
@@ -121,6 +128,89 @@ if uploaded is not None:
     image_bytes = uploaded.getvalue()
     mime_type = uploaded.type or "image/png"
 
+    # --- Manual calibration UI ---
+    if manual_calibration:
+        st.subheader("Manual Calibration")
+        st.markdown(
+            "Click **Point 1** (top-left of plot area) and **Point 2** "
+            "(bottom-right of plot area) on the image below, then enter "
+            "their data coordinates."
+        )
+
+        # Determine original image dimensions for coordinate scaling
+        pil_img = Image.open(uploaded)
+        orig_w, orig_h = pil_img.size
+        uploaded.seek(0)  # reset after PIL read
+
+        # Render at a fixed display width so we can compute the scale factor.
+        # The component returns click coords relative to the displayed size.
+        display_w = min(orig_w, 700)
+        scale = orig_w / display_w
+
+        # Let user pick which point to capture
+        cal_point_sel = st.radio(
+            "Capture point",
+            ["Point 1 (top-left)", "Point 2 (bottom-right)"],
+            horizontal=True,
+            key="cal_point_sel",
+        )
+
+        # Show clickable image
+        coords = streamlit_image_coordinates(
+            pil_img, width=display_w, key="cal_image", cursor="crosshair",
+        )
+
+        # Process click
+        if coords is not None:
+            px_col = int(coords["x"] * scale)
+            px_row = int(coords["y"] * scale)
+
+            if cal_point_sel == "Point 1 (top-left)":
+                st.session_state["cal_pixel_1"] = (px_col, px_row)
+            else:
+                st.session_state["cal_pixel_2"] = (px_col, px_row)
+
+        # Data coordinate inputs for both points
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            st.markdown("**Point 1 (top-left)**")
+            p1_px = st.session_state.get("cal_pixel_1")
+            if p1_px:
+                st.caption(f"Pixel: ({p1_px[0]}, {p1_px[1]})")
+            else:
+                st.caption("Click on image to set")
+            p1_x = st.number_input("Point 1 X", value=0.0, key="cal_p1_x")
+            p1_y = st.number_input("Point 1 Y", value=1.0, key="cal_p1_y")
+        with col_p2:
+            st.markdown("**Point 2 (bottom-right)**")
+            p2_px = st.session_state.get("cal_pixel_2")
+            if p2_px:
+                st.caption(f"Pixel: ({p2_px[0]}, {p2_px[1]})")
+            else:
+                st.caption("Click on image to set")
+            p2_x = st.number_input("Point 2 X", value=5.0, key="cal_p2_x")
+            p2_y = st.number_input("Point 2 Y", value=0.0, key="cal_p2_y")
+
+        # Build calibration_points if both pixel positions are set
+        if p1_px and p2_px:
+            st.session_state["calibration_points"] = {
+                "pixel_1": p1_px,
+                "data_1": (p1_x, p1_y),
+                "pixel_2": p2_px,
+                "data_2": (p2_x, p2_y),
+            }
+            st.success(
+                f"Calibration set: Point 1 ({p1_px[0]}, {p1_px[1]}) = ({p1_x}, {p1_y}), "
+                f"Point 2 ({p2_px[0]}, {p2_px[1]}) = ({p2_x}, {p2_y})"
+            )
+        else:
+            st.session_state.pop("calibration_points", None)
+            st.info("Click on the image to set both calibration points.")
+    else:
+        # Clear calibration state when toggle is off
+        for key in ("cal_pixel_1", "cal_pixel_2", "calibration_points"):
+            st.session_state.pop(key, None)
+
     if st.button("Extract Data", type="primary"):
         # Clear chat state on new extraction
         st.session_state.pop("chat_messages", None)
@@ -131,6 +221,7 @@ if uploaded is not None:
 
         hint = chart_type_hint if chart_type_hint != "Auto-detect" else None
         use_hybrid = extraction_method == "Pixel-enhanced (hybrid)"
+        cal_pts = st.session_state.get("calibration_points")
         spinner_text = (
             "Analyzing chart with Claude Vision + pixel tracing..."
             if use_hybrid
@@ -139,7 +230,11 @@ if uploaded is not None:
         with st.spinner(spinner_text):
             try:
                 if use_hybrid:
-                    result = extract_chart_data_hybrid(image_bytes, mime_type, chart_type_hint=hint)
+                    result = extract_chart_data_hybrid(
+                        image_bytes, mime_type,
+                        chart_type_hint=hint,
+                        calibration_points=cal_pts,
+                    )
                 else:
                     result = extract_chart_data(image_bytes, mime_type, chart_type_hint=hint)
                     result["extraction_method"] = "ai-only"
@@ -148,9 +243,21 @@ if uploaded is not None:
                 result = None
 
         if result is not None:
+            # Derive bounds_override for auto_refine if calibration was used
+            bounds_override = None
+            if cal_pts:
+                bounds_override, _ = PlotBounds.from_calibration_points(
+                    pixel_1=cal_pts["pixel_1"],
+                    data_1=cal_pts["data_1"],
+                    pixel_2=cal_pts["pixel_2"],
+                    data_2=cal_pts["data_2"],
+                )
             with st.spinner("Verifying extraction against original chart..."):
                 try:
-                    result = auto_refine_extraction(image_bytes, mime_type, result)
+                    result = auto_refine_extraction(
+                        image_bytes, mime_type, result,
+                        bounds_override=bounds_override,
+                    )
                     # Pull out the pre-generated overlay if available
                     overlay_from_refine = result.pop("_overlay_bytes", None)
                     if overlay_from_refine:

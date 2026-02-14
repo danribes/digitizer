@@ -5,9 +5,10 @@ import logging
 import anthropic
 
 from pixel_tracer import (
-    AxisRange, SeriesSpec, extract_curves_from_image, generate_overlay,
-    snap_series_to_pixels, calibrate_axes, assess_extraction_accuracy,
-    detect_plot_bounds,
+    AxisRange, PlotBounds, SeriesSpec, extract_curves_from_image, generate_overlay,
+    snap_series_to_pixels, snap_series_to_pixels_guided, calibrate_axes,
+    assess_extraction_accuracy,
+    detect_plot_bounds, extract_with_plotdigitizer, _build_per_series_masks,
 )
 from PIL import Image
 import numpy as np
@@ -15,6 +16,144 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-5-20250929"
+CALIBRATION_MODEL = "claude-haiku-4-5-20251001"
+
+# ---------------------------------------------------------------------------
+# AI Calibration Assessment (Phase 1 lightweight verification)
+# ---------------------------------------------------------------------------
+
+CALIBRATION_TOOL = {
+    "name": "verify_chart_calibration",
+    "description": "Verify axis calibration and classify chart type.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "x_min": {"type": "number"},
+            "x_max": {"type": "number"},
+            "y_min": {"type": "number"},
+            "y_max": {"type": "number"},
+            "x_tick_values": {
+                "type": "array", "items": {"type": "number"},
+                "description": "Numeric values at each x-axis tick mark, left to right.",
+            },
+            "y_tick_values": {
+                "type": "array", "items": {"type": "number"},
+                "description": "Numeric values at each y-axis tick mark, top to bottom.",
+            },
+            "is_color_chart": {
+                "type": "boolean",
+                "description": "True if series have visually distinct colors (not just BW/grayscale line styles).",
+            },
+            "series_info": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "line_style": {
+                            "type": "string",
+                            "enum": ["solid", "dashed", "dotted", "unknown"],
+                        },
+                        "color_description": {"type": "string"},
+                    },
+                    "required": ["name", "line_style", "color_description"],
+                },
+            },
+            "corrections": {
+                "type": "string",
+                "description": "Description of any corrections made vs. the pixel-detected values, or 'none'.",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+            },
+        },
+        "required": [
+            "x_min", "x_max", "y_min", "y_max",
+            "x_tick_values", "y_tick_values",
+            "is_color_chart", "series_info",
+            "corrections", "confidence",
+        ],
+    },
+}
+
+CALIBRATION_SYSTEM_PROMPT = """You are verifying axis calibration for a chart image. \
+You will be given a pixel-detection report for comparison. Your job:
+
+1. Read the chart's axis labels and tick marks directly from the image.
+2. Report the correct axis ranges (x_min, x_max, y_min, y_max).
+3. List the numeric value at each tick mark on both axes.
+4. Classify: is this a COLOR chart (series have distinct hues like red/blue/green) \
+or a BW/grayscale chart (series distinguished only by line style — solid, dashed, dotted)?
+5. List each data series with its name (from legend), line style, and color description.
+
+Call the verify_chart_calibration tool with your findings."""
+
+
+def _ai_calibration_assessment(
+    image_bytes: bytes,
+    mime_type: str,
+    axis: "AxisRange",
+    calibration: dict,
+) -> dict | None:
+    """Lightweight AI call to verify axis calibration and classify chart.
+
+    Uses Haiku for speed and cost (~$0.001/call). Returns the tool output
+    dict or None on failure.
+    """
+    try:
+        client = anthropic.Anthropic()
+        b64_image = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+        quality = calibration.get("alignment_quality", "unknown")
+        n_x = len(calibration.get("x_tick_cols", []))
+        n_y = len(calibration.get("y_tick_rows", []))
+
+        user_text = (
+            f"Pixel detection found:\n"
+            f"- Axis range: x=[{axis.x_min}, {axis.x_max}], y=[{axis.y_min}, {axis.y_max}]\n"
+            f"- {n_x} x-ticks, {n_y} y-ticks detected\n"
+            f"- Calibration quality: {quality}\n\n"
+            f"Please verify by reading the chart's axis labels and tick marks.\n"
+            f"Report the correct axis ranges and the numeric value at each tick mark.\n"
+            f"Also: is this a color chart (series have distinct colors) or BW/grayscale "
+            f"(series distinguished only by line style)?\n"
+            f"List each series with its name, line style, and color description."
+        )
+
+        response = client.messages.create(
+            model=CALIBRATION_MODEL,
+            max_tokens=1024,
+            system=CALIBRATION_SYSTEM_PROMPT,
+            tools=[CALIBRATION_TOOL],
+            tool_choice={"type": "tool", "name": "verify_chart_calibration"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": b64_image,
+                        },
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            }],
+        )
+
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "verify_chart_calibration":
+                return block.input
+
+        logger.warning("AI calibration: no tool response returned.")
+        return None
+
+    except Exception as exc:
+        logger.warning("AI calibration assessment failed: %s", exc)
+        return None
+
 
 EXTRACTION_TOOL = {
     "name": "store_chart_data",
@@ -402,6 +541,7 @@ def auto_refine_extraction(
     mime_type: str,
     result: dict,
     max_rounds: int = 2,
+    bounds_override: PlotBounds | None = None,
 ) -> dict:
     """Two-phase extraction refinement: axis calibration then accuracy-driven AI correction.
 
@@ -420,6 +560,9 @@ def auto_refine_extraction(
         mime_type: MIME type of the original image.
         result: Current extraction result dict (from initial AI extraction).
         max_rounds: Max AI correction rounds (default 2).
+        bounds_override: Pre-computed plot bounds from manual calibration.
+            When provided, skips plot bounds detection and AI calibration
+            assessment.
 
     Returns:
         Updated result dict with ``_overlay_bytes``, ``_calibration``, and
@@ -434,10 +577,14 @@ def auto_refine_extraction(
 
     axis = AxisRange(ar["x_min"], ar["x_max"], ar["y_min"], ar["y_max"])
     img = np.array(Image.open(_io.BytesIO(image_bytes)).convert("RGB"))
-    bounds = detect_plot_bounds(img)
-    if bounds is None or bounds.height < 20:
-        logger.warning("Cannot auto-refine: plot bounds detection failed.")
-        return result
+
+    if bounds_override is not None:
+        bounds = bounds_override
+    else:
+        bounds = detect_plot_bounds(img)
+        if bounds is None or bounds.height < 20:
+            logger.warning("Cannot auto-refine: plot bounds detection failed.")
+            return result
 
     # =================================================================
     # PHASE 1: Axis calibration + alignment assessment
@@ -452,22 +599,145 @@ def auto_refine_extraction(
     for k, v in calibration["metrics"].items():
         logger.info("  %s: %s", k, v)
 
-    # Pixel-snap correction using the calibrated axis mapping
+    # --- AI calibration verification + chart classification ---
+    # Skip AI calibration when bounds are manually provided (user already calibrated)
+    is_bw: bool | None = None
+    series_info: list | None = None
+    if bounds_override is not None:
+        logger.info("Manual calibration provided, skipping AI calibration assessment.")
+    else:
+        ai_cal = _ai_calibration_assessment(image_bytes, mime_type, axis, calibration)
+        if ai_cal and ai_cal.get("confidence") != "low":
+            # Update axis range if AI disagrees
+            ai_axis = AxisRange(
+                ai_cal["x_min"], ai_cal["x_max"],
+                ai_cal["y_min"], ai_cal["y_max"],
+            )
+            if (ai_axis.x_min != axis.x_min or ai_axis.x_max != axis.x_max
+                    or ai_axis.y_min != axis.y_min or ai_axis.y_max != axis.y_max):
+                logger.info(
+                    "AI calibration corrected axis: x=[%.2f,%.2f]→[%.2f,%.2f], "
+                    "y=[%.2f,%.2f]→[%.2f,%.2f]",
+                    axis.x_min, axis.x_max, ai_axis.x_min, ai_axis.x_max,
+                    axis.y_min, axis.y_max, ai_axis.y_min, ai_axis.y_max,
+                )
+                axis = ai_axis
+            is_bw = not ai_cal.get("is_color_chart", True)
+            series_info = ai_cal.get("series_info")
+            logger.info(
+                "AI classification: is_bw=%s, confidence=%s, series=%d, corrections=%s",
+                is_bw, ai_cal.get("confidence"), len(series_info or []),
+                ai_cal.get("corrections", "none"),
+            )
+        else:
+            reason = "low confidence" if ai_cal else "call failed"
+            logger.info("AI calibration skipped (%s), using pixel-only calibration.", reason)
+
+    # --- Build per-series color masks for targeted assessment ---
+    per_series_masks = None
     try:
-        snapped = snap_series_to_pixels(image_bytes, result["data_series"], axis)
-        result = {**result, "data_series": snapped}
-        logger.info("Pixel-snap correction applied to %d series.", len(snapped))
+        per_series_masks, _ = _build_per_series_masks(
+            img, result["data_series"], bounds, axis,
+        )
+    except Exception as exc:
+        logger.warning("Per-series mask building failed: %s", exc)
+
+    # --- Run competing extraction algorithms and pick the best ---
+
+    # For BW charts, pixel-enhanced extraction often collapses same-color
+    # curves.  Re-extract with AI-only to get reliable per-series guides.
+    # Computed before Algorithm A so guided snap can use it too.
+    guide_series = result["data_series"]
+    if is_bw and result.get("extraction_method") == "pixel-enhanced":
+        try:
+            logger.info("BW chart from pixel-enhanced: re-extracting AI-only for guides.")
+            ai_only = extract_chart_data(image_bytes, mime_type)
+            ai_guide_series = ai_only.get("data_series", [])
+            if len(ai_guide_series) >= 2:
+                guide_series = ai_guide_series
+                logger.info("Using AI-only guides: %s",
+                            [(s["name"], len(s.get("data", []))) for s in guide_series])
+        except Exception as exc:
+            logger.warning("AI-only re-extraction failed: %s", exc)
+
+    # Algorithm A: pixel-snap
+    # For BW charts, use guided snap (per-series masks with gap-bridging)
+    # to avoid text-pixel corruption from the raw dark_mask.
+    snap_result = None
+    snap_accuracy = None
+    try:
+        if is_bw:
+            snapped = snap_series_to_pixels_guided(
+                image_bytes, guide_series, axis,
+                series_info=series_info,
+            )
+        else:
+            snapped = snap_series_to_pixels(
+                image_bytes, result["data_series"], axis,
+            )
+        snap_result = snapped
+        snap_accuracy = assess_extraction_accuracy(
+            img, snapped, bounds, axis, per_series_masks=per_series_masks,
+        )
+        logger.info(
+            "Phase 1 — Pixel-snap accuracy: MAE=%.4f, within_3%%=%.1f%%",
+            snap_accuracy["overall_mae"],
+            snap_accuracy["overall_within_3pct"] * 100,
+        )
     except Exception as exc:
         logger.warning("Pixel-snap failed: %s", exc)
 
-    # Initial accuracy assessment after pixel-snap
-    accuracy = assess_extraction_accuracy(img, result["data_series"], bounds, axis)
-    logger.info(
-        "Phase 1 — Post-snap accuracy: MAE=%.4f, within_3%%=%.1f%%, pass=%s",
-        accuracy["overall_mae"],
-        accuracy["overall_within_3pct"] * 100,
-        accuracy["passed"],
-    )
+    # Algorithm B: plotdigitizer (with BW/color classification)
+    pd_result = None
+    pd_accuracy = None
+    try:
+        pd_series = extract_with_plotdigitizer(
+            image_bytes, guide_series, axis,
+            is_bw=is_bw, series_info=series_info,
+        )
+        pd_result = pd_series
+        pd_accuracy = assess_extraction_accuracy(
+            img, pd_series, bounds, axis, per_series_masks=per_series_masks,
+        )
+        logger.info(
+            "Phase 1 — PlotDigitizer accuracy: MAE=%.4f, within_3%%=%.1f%%",
+            pd_accuracy["overall_mae"],
+            pd_accuracy["overall_within_3pct"] * 100,
+        )
+    except Exception as exc:
+        logger.warning("PlotDigitizer failed: %s", exc)
+
+    # Pick the winner by MAE (lower is better)
+    if pd_result is not None and pd_accuracy is not None and (
+        snap_accuracy is None
+        or pd_accuracy["overall_mae"] < snap_accuracy["overall_mae"]
+    ):
+        result = {**result, "data_series": pd_result}
+        result["_extraction_algorithm"] = "plotdigitizer"
+        accuracy = pd_accuracy
+        logger.info("Phase 1 — Winner: plotdigitizer (MAE=%.4f)", pd_accuracy["overall_mae"])
+    elif snap_result is not None and snap_accuracy is not None:
+        result = {**result, "data_series": snap_result}
+        result["_extraction_algorithm"] = "pixel-snap"
+        accuracy = snap_accuracy
+        logger.info("Phase 1 — Winner: pixel-snap (MAE=%.4f)", snap_accuracy["overall_mae"])
+    else:
+        # Both failed — keep original AI extraction
+        accuracy = assess_extraction_accuracy(
+            img, result["data_series"], bounds, axis, per_series_masks=per_series_masks,
+        )
+        result["_extraction_algorithm"] = "ai-only"
+        logger.warning("Phase 1 — Both algorithms failed, keeping AI-only extraction.")
+
+    # Update axis_range on result if AI calibration corrected it
+    result["axis_range"] = {
+        "x_min": axis.x_min, "x_max": axis.x_max,
+        "y_min": axis.y_min, "y_max": axis.y_max,
+    }
+
+    # Store AI calibration info for diagnostics
+    if ai_cal:
+        result["_ai_calibration"] = ai_cal
 
     # =================================================================
     # PHASE 2: AI correction rounds driven by CV accuracy feedback
@@ -483,6 +753,7 @@ def auto_refine_extraction(
                 image_bytes,
                 current["data_series"],
                 axis,
+                bounds_override=bounds_override,
             )
         except Exception as exc:
             logger.warning("Overlay generation failed in round %d: %s", round_num, exc)
@@ -568,7 +839,9 @@ def auto_refine_extraction(
         current = refined
 
         # Re-assess accuracy after AI correction
-        accuracy = assess_extraction_accuracy(img, current["data_series"], bounds, axis)
+        accuracy = assess_extraction_accuracy(
+            img, current["data_series"], bounds, axis, per_series_masks=per_series_masks,
+        )
         logger.info(
             "Phase 2 — Round %d accuracy: MAE=%.4f, within_3%%=%.1f%%, pass=%s",
             round_num + 1,
@@ -583,7 +856,8 @@ def auto_refine_extraction(
 
     # Generate final overlay
     try:
-        final_overlay = generate_overlay(image_bytes, current["data_series"], axis)
+        final_overlay = generate_overlay(image_bytes, current["data_series"], axis,
+                                       bounds_override=bounds_override)
         current["_overlay_bytes"] = final_overlay
     except Exception:
         pass
@@ -742,15 +1016,36 @@ def extract_chart_data_hybrid(
     image_bytes: bytes,
     mime_type: str,
     chart_type_hint: str | None = None,
+    calibration_points: dict | None = None,
 ) -> dict:
     """Hybrid extraction: Claude metadata + pixel-based curve tracing.
 
     Falls back to AI-only extraction on any failure.
 
+    Args:
+        image_bytes: Raw image bytes.
+        mime_type: MIME type of the image.
+        chart_type_hint: Optional chart type hint.
+        calibration_points: Optional manual calibration dict with keys
+            pixel_1, data_1, pixel_2, data_2. When provided, axis range
+            and plot bounds are derived from these points instead of from
+            AI metadata.
+
     Returns:
         Dict with chart_type, title, x_label, y_label, data_series, notes,
         and extraction_method ("pixel-enhanced" or "ai-only").
     """
+    # Derive bounds and axis range from manual calibration if provided
+    cal_bounds: PlotBounds | None = None
+    cal_axis: AxisRange | None = None
+    if calibration_points:
+        cal_bounds, cal_axis = PlotBounds.from_calibration_points(
+            pixel_1=calibration_points["pixel_1"],
+            data_1=calibration_points["data_1"],
+            pixel_2=calibration_points["pixel_2"],
+            data_2=calibration_points["data_2"],
+        )
+
     try:
         meta = extract_chart_metadata(image_bytes, mime_type, chart_type_hint)
     except Exception:
@@ -759,9 +1054,11 @@ def extract_chart_data_hybrid(
         result["extraction_method"] = "ai-only"
         return result
 
-    # Check if pixel tracing is viable
+    # Check if pixel tracing is viable (skip check when manually calibrated)
     chart_type = meta.get("chart_type", "").lower()
-    if not meta.get("pixel_traceable") or chart_type not in PIXEL_TRACEABLE_TYPES:
+    if not calibration_points and (
+        not meta.get("pixel_traceable") or chart_type not in PIXEL_TRACEABLE_TYPES
+    ):
         logger.info("Chart not pixel-traceable (type=%s), using AI-only.", chart_type)
         result = extract_chart_data(image_bytes, mime_type, chart_type_hint)
         result["extraction_method"] = "ai-only"
@@ -769,7 +1066,7 @@ def extract_chart_data_hybrid(
 
     # Build pixel tracer inputs from metadata
     try:
-        axis_range = AxisRange(
+        axis_range = cal_axis or AxisRange(
             x_min=float(meta["x_min"]),
             x_max=float(meta["x_max"]),
             y_min=float(meta["y_min"]),
@@ -796,6 +1093,7 @@ def extract_chart_data_hybrid(
 
         data_series = extract_curves_from_image(
             image_bytes, series_specs, axis_range, n_points=250,
+            bounds_override=cal_bounds,
         )
 
         # Validate: need at least 10 total data points

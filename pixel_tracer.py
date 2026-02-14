@@ -36,6 +36,32 @@ class PlotBounds:
     def height(self) -> int:
         return self.bottom - self.top
 
+    @staticmethod
+    def from_calibration_points(
+        pixel_1: tuple[int, int],  # (col, row) for point 1
+        data_1: tuple[float, float],  # (x, y) data coords for point 1
+        pixel_2: tuple[int, int],  # (col, row) for point 2
+        data_2: tuple[float, float],  # (x, y) data coords for point 2
+    ) -> tuple["PlotBounds", "AxisRange"]:
+        """Derive PlotBounds and AxisRange from two user-clicked calibration points.
+
+        The two points are treated as opposite corners of the plot area:
+        Point 1 = top-left corner (x_min, y_max), Point 2 = bottom-right (x_max, y_min).
+        """
+        bounds = PlotBounds(
+            left=min(pixel_1[0], pixel_2[0]),
+            right=max(pixel_1[0], pixel_2[0]),
+            top=min(pixel_1[1], pixel_2[1]),
+            bottom=max(pixel_1[1], pixel_2[1]),
+        )
+        axis_range = AxisRange(
+            x_min=min(data_1[0], data_2[0]),
+            x_max=max(data_1[0], data_2[0]),
+            y_min=min(data_1[1], data_2[1]),
+            y_max=max(data_1[1], data_2[1]),
+        )
+        return bounds, axis_range
+
 
 @dataclass
 class AxisRange:
@@ -350,6 +376,55 @@ def calibrate_axes(
     }
 
 
+def _refine_bounds_from_ticks(
+    bounds: PlotBounds,
+    x_tick_cols: list[int],
+    y_tick_rows: list[int],
+) -> PlotBounds:
+    """Refine plot bounds using detected tick positions.
+
+    Tick marks provide precise calibration points.  The base tick spacing
+    is derived from the minimum adjacent-tick gap (handling missing ticks
+    where a gap is ~2× the base).  The bounds are then snapped so that the
+    tick grid covers the full plot area.
+
+    Returns the refined PlotBounds (unchanged axes if < 3 ticks detected).
+    """
+
+    def _refine(ticks: list[int], lo: int, hi: int) -> tuple[int, int]:
+        if len(ticks) < 3:
+            return lo, hi
+        ticks_s = sorted(ticks)
+        diffs = [ticks_s[i + 1] - ticks_s[i] for i in range(len(ticks_s) - 1)]
+        base = min(diffs)
+        if base < 3:
+            return lo, hi
+        # Total base intervals between first and last tick
+        n_between = round((ticks_s[-1] - ticks_s[0]) / base)
+        if n_between <= 0:
+            return lo, hi
+        spacing = (ticks_s[-1] - ticks_s[0]) / n_between
+        # Verify all gaps are integer multiples of spacing (within 20%).
+        # Non-uniform tick spacing (e.g. 0,3,6,12,18,24) would produce
+        # wrong results.
+        for d in diffs:
+            m = d / spacing
+            if abs(m - round(m)) > 0.2:
+                return lo, hi
+        # How many intervals from bound-lo to first tick / last tick to bound-hi
+        k_lo = round((ticks_s[0] - lo) / spacing)
+        k_hi = round((hi - ticks_s[-1]) / spacing)
+        new_lo = int(round(ticks_s[0] - k_lo * spacing))
+        new_hi = int(round(ticks_s[-1] + k_hi * spacing))
+        return new_lo, new_hi
+
+    new_left, new_right = _refine(x_tick_cols, bounds.left, bounds.right)
+    new_top, new_bottom = _refine(y_tick_rows, bounds.top, bounds.bottom)
+    return PlotBounds(
+        left=new_left, right=new_right, top=new_top, bottom=new_bottom,
+    )
+
+
 def _build_curve_mask(img: np.ndarray, bounds: PlotBounds) -> np.ndarray:
     """Build a binary mask of curve pixels, excluding axes and censoring marks.
 
@@ -384,17 +459,446 @@ def _build_curve_mask(img: np.ndarray, bounds: PlotBounds) -> np.ndarray:
     return dark
 
 
+def _detect_curve_origin(
+    img: np.ndarray,
+    raw_bounds: PlotBounds,
+    dark_mask: np.ndarray,
+    x_ticks: list[int],
+    y_ticks: list[int],
+) -> tuple[int, int] | None:
+    """Detect the pixel where curves start at (x_min, y_max).
+
+    Uses tick-refined bounds to extrapolate the origin — the first detected
+    tick may not be at x_min (e.g. ticks at x=6,12,... with origin at x=0).
+
+    Returns (origin_col, origin_row) or None if detection fails.
+    """
+    gray = np.mean(img, axis=2) if img.ndim == 3 else img.astype(float)
+
+    # Strategy 1: use tick-refined bounds (extrapolates origin from spacing)
+    if x_ticks and y_ticks:
+        tick_bounds = _refine_bounds_from_ticks(raw_bounds, x_ticks, y_ticks)
+        origin_col = tick_bounds.left   # x_min position
+        origin_row = tick_bounds.top    # y_max position
+    else:
+        # Strategy 2: scan dark_mask from top-left for first dark cluster
+        search_rows = range(raw_bounds.top, min(raw_bounds.top + 30, raw_bounds.bottom))
+        search_cols = range(raw_bounds.left, min(raw_bounds.left + 30, raw_bounds.right))
+        for r in search_rows:
+            for c in search_cols:
+                if dark_mask[r, c]:
+                    origin_col, origin_row = c, r
+                    break
+            else:
+                continue
+            break
+        else:
+            return None
+
+    # Validate: check that the origin is within the image and near the
+    # raw plot bounds.  For KM curves the exact origin pixel is often
+    # white (axis intersection) so we only do a loose sanity check — the
+    # nearby area should have *some* dark content (axis line, curve, or
+    # label) within a wider radius.
+    if not (0 <= origin_row < gray.shape[0] and 0 <= origin_col < gray.shape[1]):
+        return None
+    r_lo = max(0, origin_row - 8)
+    r_hi = min(gray.shape[0], origin_row + 9)
+    c_lo = max(0, origin_col - 3)
+    c_hi = min(gray.shape[1], origin_col + 12)
+    patch = gray[r_lo:r_hi, c_lo:c_hi]
+    if patch.size == 0 or patch.min() > 200:
+        return None
+
+    return (origin_col, origin_row)
+
+
+def _origin_anchored_calibration(
+    origin: tuple[int, int],
+    x_ticks: list[int],
+    y_ticks: list[int],
+    raw_bounds: PlotBounds,
+    axis_range: AxisRange,
+) -> tuple[PlotBounds, dict]:
+    """Use origin pixel as calibration anchor combined with tick spacing.
+
+    Returns (refined_bounds, calibration_report).
+    """
+    # Start with tick-refined bounds
+    tick_bounds = _refine_bounds_from_ticks(raw_bounds, x_ticks, y_ticks)
+    origin_col, origin_row = origin
+
+    # Origin pixel MUST map to (x_min, y_max).
+    # Override bounds.left and bounds.top if within 5px of tick-based values.
+    new_left = tick_bounds.left
+    new_top = tick_bounds.top
+    new_right = tick_bounds.right
+    new_bottom = tick_bounds.bottom
+
+    if abs(origin_col - tick_bounds.left) <= 5:
+        new_left = origin_col
+    if abs(origin_row - tick_bounds.top) <= 5:
+        new_top = origin_row
+
+    # Recompute right/bottom from origin + tick spacing scale
+    if x_ticks and len(x_ticks) >= 2:
+        x_sorted = sorted(x_ticks)
+        diffs = [x_sorted[i + 1] - x_sorted[i] for i in range(len(x_sorted) - 1)]
+        base_x = min(diffs)
+        if base_x >= 3:
+            n_total = round((x_sorted[-1] - x_sorted[0]) / base_x)
+            if n_total > 0:
+                spacing_x = (x_sorted[-1] - x_sorted[0]) / n_total
+                # How many intervals from origin to last tick, then to right edge
+                k_right = round((tick_bounds.right - x_sorted[-1]) / spacing_x)
+                new_right = int(round(x_sorted[-1] + k_right * spacing_x))
+
+    if y_ticks and len(y_ticks) >= 2:
+        y_sorted = sorted(y_ticks)
+        diffs = [y_sorted[i + 1] - y_sorted[i] for i in range(len(y_sorted) - 1)]
+        base_y = min(diffs)
+        if base_y >= 3:
+            n_total = round((y_sorted[-1] - y_sorted[0]) / base_y)
+            if n_total > 0:
+                spacing_y = (y_sorted[-1] - y_sorted[0]) / n_total
+                k_bottom = round((tick_bounds.bottom - y_sorted[-1]) / spacing_y)
+                new_bottom = int(round(y_sorted[-1] + k_bottom * spacing_y))
+
+    refined = PlotBounds(
+        left=new_left, right=new_right,
+        top=new_top, bottom=new_bottom,
+    )
+
+    # Build calibration report
+    report: dict = {
+        "origin_pixel": (origin_col, origin_row),
+        "origin_data": (axis_range.x_min, axis_range.y_max),
+        "tick_consistency": "unknown",
+        "quality": "poor",
+    }
+
+    # Check origin-tick consistency: origin should agree with tick_bounds
+    if x_ticks and y_ticks:
+        x_sorted = sorted(x_ticks)
+        y_sorted = sorted(y_ticks)
+        x_err = abs(origin_col - tick_bounds.left)
+        y_err = abs(origin_row - tick_bounds.top)
+        report["origin_tick_x_err_px"] = x_err
+        report["origin_tick_y_err_px"] = y_err
+        consistent = x_err <= 3 and y_err <= 3
+        report["tick_consistency"] = "consistent" if consistent else "offset"
+
+        # Tick-to-data mappings
+        x_range = axis_range.x_max - axis_range.x_min
+        y_range = axis_range.y_max - axis_range.y_min
+        tick_mappings = []
+        for xt in x_sorted:
+            x_frac = (xt - refined.left) / max(1, refined.width)
+            tick_mappings.append({"pixel_col": xt,
+                                  "data_x": round(axis_range.x_min + x_frac * x_range, 3)})
+        for yt in y_sorted:
+            y_frac = (refined.bottom - yt) / max(1, refined.height)
+            tick_mappings.append({"pixel_row": yt,
+                                  "data_y": round(axis_range.y_min + y_frac * y_range, 3)})
+        report["tick_mappings"] = tick_mappings
+
+        if consistent and len(x_ticks) >= 3 and len(y_ticks) >= 3:
+            report["quality"] = "excellent"
+        elif x_err <= 5 and y_err <= 5:
+            report["quality"] = "good"
+
+    return refined, report
+
+
+def _detect_series_colors(
+    img: np.ndarray,
+    data_series: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+    search_radius: int = 50,
+) -> list[tuple[int, int, int]]:
+    """Detect the dominant color of each AI series from the image.
+
+    For each data point, finds all curve-like segments in the column
+    (gray < 220, non-white, non-black), picks the segment closest to
+    the AI y-position, and samples its median color.  This is robust
+    even when AI y-values are off by 50+ pixels.
+
+    Returns:
+        List of (R, G, B) tuples, one per series.
+    """
+    gray = img.mean(axis=2)
+
+    colors: list[tuple[int, int, int]] = []
+    for series in data_series:
+        pixels: list[tuple[int, int, int]] = []
+        for pt in series.get("data", []):
+            if "x" not in pt or "y" not in pt:
+                continue
+            x, y = float(pt["x"]), float(pt["y"])
+            col, row_expected = _data_to_pixel(x, y, bounds, axis_range)
+            if col <= bounds.left + 5 or col >= bounds.right - 2:
+                continue
+
+            # Find all curve-like pixel segments in this column
+            col_lo = max(bounds.left, col - 1)
+            col_hi = min(bounds.right, col + 1)
+            # Use a lenient threshold to catch grey curves too
+            band_gray = gray[bounds.top:bounds.bottom + 1, col_lo:col_hi + 1].min(axis=1)
+            curve_rows = np.where(band_gray < 220)[0] + bounds.top
+
+            if len(curve_rows) == 0:
+                continue
+
+            # Cluster into contiguous segments
+            diffs = np.diff(curve_rows)
+            splits = np.where(diffs > 5)[0] + 1
+            segments = np.split(curve_rows, splits)
+
+            # Pick the segment closest to AI expected row
+            best_seg = None
+            best_dist = float("inf")
+            for seg in segments:
+                if len(seg) < 2:
+                    continue
+                seg_center = float(seg.mean())
+                dist = abs(seg_center - row_expected)
+                if dist < best_dist and dist <= search_radius:
+                    best_dist = dist
+                    best_seg = seg
+
+            if best_seg is not None:
+                # Sample the darkest pixel in the segment (curve core)
+                seg_pixels = img[best_seg, col]  # (N, 3)
+                # Pick the pixel with lowest brightness (most likely the
+                # actual curve rather than anti-aliased edge)
+                brightness = seg_pixels.sum(axis=1)
+                darkest_idx = np.argmin(brightness)
+                px = seg_pixels[darkest_idx]
+                pixels.append((int(px[0]), int(px[1]), int(px[2])))
+
+        if pixels:
+            arr = np.array(pixels)
+            median_rgb = (int(np.median(arr[:, 0])),
+                          int(np.median(arr[:, 1])),
+                          int(np.median(arr[:, 2])))
+            colors.append(median_rgb)
+        else:
+            colors.append((80, 80, 80))  # fallback grey
+    return colors
+
+
+def _colors_all_similar(colors: list[tuple], threshold: float = 50.0) -> bool:
+    """Check if all detected series colors are effectively the same.
+
+    Two checks:
+      1. All pairwise Euclidean RGB distances < threshold.
+      2. All colors are achromatic (R≈G≈B within 30).  This catches
+         grayscale/BW charts where sparse-pixel sampling produces
+         varying brightness levels (e.g. black vs medium-gray) but the
+         curves are really all the same color.
+    """
+    all_close = True
+    for i in range(len(colors)):
+        for j in range(i + 1, len(colors)):
+            dist = sum((a - b) ** 2 for a, b in zip(colors[i], colors[j])) ** 0.5
+            if dist > threshold:
+                all_close = False
+                break
+        if not all_close:
+            break
+    if all_close:
+        return True
+    # All achromatic → grayscale chart (different brightness is a sampling artifact)
+    for c in colors:
+        if max(c) - min(c) > 30:
+            return False
+    return True
+
+
+def _infer_line_style(name: str) -> str | None:
+    """Parse line-style hints from AI series names."""
+    low = name.lower()
+    if "solid" in low:
+        return "solid"
+    if "dash" in low:
+        return "dashed"
+    if "dot" in low:
+        return "dotted"
+    return None
+
+
+def _build_per_series_masks(
+    img: np.ndarray,
+    data_series: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Build a targeted color mask for each AI series.
+
+    Strategy: detect each series' color, then find all curve-like pixels
+    (gray < 220, not white, not black) and assign each to the nearest
+    series by RGB distance.  This avoids fixed-tolerance misses.
+
+    For single-series charts, falls back to ``make_color_mask`` with a
+    generous tolerance.
+
+    Returns:
+        (per_series_masks, union_mask) where each entry is a boolean array
+        of the same shape as the image (H, W).
+    """
+    from scipy.ndimage import binary_opening
+
+    colors = _detect_series_colors(img, data_series, bounds, axis_range)
+    # Two-pass opening: horizontal (1,3) removes vertical cross arms
+    # (<3px wide), vertical (2,1) removes single-row stray pixels from
+    # horizontal cross arms.  Actual curve lines (≥2px tall) survive.
+    h_kernel = np.ones((1, 3), dtype=bool)
+    v_kernel = np.ones((2, 1), dtype=bool)
+    n_series = len(data_series)
+
+    def _clean_mask(mask: np.ndarray) -> np.ndarray:
+        mask = binary_opening(mask, structure=h_kernel)
+        mask = binary_opening(mask, structure=v_kernel)
+        return mask
+
+    if n_series <= 1:
+        # Single series — use make_color_mask with generous tolerance
+        masks: list[np.ndarray] = []
+        union = np.zeros(img.shape[:2], dtype=bool)
+        for color in colors:
+            mask = make_color_mask(img, color, tolerance=70, bounds=bounds)
+            axis_margin = 4
+            for r in range(max(0, bounds.bottom - axis_margin),
+                           min(img.shape[0], bounds.bottom + axis_margin + 1)):
+                mask[r, :] = False
+            for c in range(max(0, bounds.left - axis_margin),
+                           min(img.shape[1], bounds.left + axis_margin + 1)):
+                mask[:, c] = False
+            mask = _clean_mask(mask)
+            masks.append(mask)
+            union |= mask
+        return masks, union
+
+    # Same-color charts: separate by line style instead of color
+    if _colors_all_similar(colors):
+        # Build global curve mask (same filter as below)
+        gray = img.mean(axis=2)
+        r_ch, g_ch, b_ch = (img[:, :, 0].astype(np.int16),
+                             img[:, :, 1].astype(np.int16),
+                             img[:, :, 2].astype(np.int16))
+        brightness = r_ch + g_ch + b_ch
+        curve_pixels = (gray < 220) & (brightness > 100) & (brightness < 680)
+        axis_margin = 4
+        for row in range(max(0, bounds.bottom - axis_margin),
+                         min(img.shape[0], bounds.bottom + axis_margin + 1)):
+            curve_pixels[row, :] = False
+        for col_px in range(max(0, bounds.left - axis_margin),
+                            min(img.shape[1], bounds.left + axis_margin + 1)):
+            curve_pixels[:, col_px] = False
+        plot_mask = np.zeros(img.shape[:2], dtype=bool)
+        plot_mask[max(0, bounds.top - 5):bounds.bottom + 1,
+                  bounds.left:bounds.right + 5] = True
+        curve_pixels &= plot_mask
+
+        # Classify by line style
+        style_masks = classify_line_style(curve_pixels, bounds)
+
+        # Infer line styles from AI series names
+        hints = [_infer_line_style(s.get("name", "")) for s in data_series]
+        distinct_hints = [h for h in hints if h is not None]
+
+        if (len(distinct_hints) == n_series
+                and len(set(distinct_hints)) == n_series):
+            # All series have distinct style hints -- assign style sub-masks
+            # but only if every sub-mask has enough pixels for assessment
+            masks = []
+            for h in hints:
+                m = _clean_mask(style_masks.get(h, np.zeros(img.shape[:2], dtype=bool)))
+                masks.append(m)
+            if all(m.sum() >= 30 for m in masks):
+                union = np.zeros(img.shape[:2], dtype=bool)
+                for m in masks:
+                    union |= m
+                return masks, union
+            # else fall through to global mask path
+
+        # No hints, ambiguous, or style sub-masks too sparse --
+        # skip _clean_mask so dashed/dotted segments survive
+        masks = [curve_pixels.copy() for _ in range(n_series)]
+        union = curve_pixels.copy()
+        return masks, union
+
+    # Multi-series: find all "curve-like" pixels, assign by nearest color
+    gray = img.mean(axis=2)
+    r, g, b = img[:, :, 0].astype(np.int16), img[:, :, 1].astype(np.int16), img[:, :, 2].astype(np.int16)
+    brightness = r + g + b
+
+    # Curve-like: darker than background, not black axes/text
+    curve_pixels = (gray < 220) & (brightness > 100) & (brightness < 680)
+
+    # Exclude axis lines
+    axis_margin = 4
+    for row in range(max(0, bounds.bottom - axis_margin),
+                     min(img.shape[0], bounds.bottom + axis_margin + 1)):
+        curve_pixels[row, :] = False
+    for col_px in range(max(0, bounds.left - axis_margin),
+                        min(img.shape[1], bounds.left + axis_margin + 1)):
+        curve_pixels[:, col_px] = False
+
+    # Restrict to plot area with small margin
+    plot_mask = np.zeros(img.shape[:2], dtype=bool)
+    plot_mask[max(0, bounds.top - 5):bounds.bottom + 1,
+              bounds.left:bounds.right + 5] = True
+    curve_pixels &= plot_mask
+
+    # Assign each curve pixel to the nearest series by Euclidean RGB
+    # distance.  This correctly separates grey vs teal curves.  Anti-aliased
+    # edges may be assigned to the wrong series (fragmenting masks to 2–3px
+    # slivers), but trace_curve handles this via a relaxed segment gap.
+    color_arr = np.array(colors, dtype=np.float64)  # (N, 3)
+
+    masks = [np.zeros(img.shape[:2], dtype=bool) for _ in range(n_series)]
+    union = np.zeros(img.shape[:2], dtype=bool)
+
+    rows, cols = np.where(curve_pixels)
+    if len(rows) > 0:
+        px_rgb = img[rows, cols].astype(np.float64)  # (M, 3)
+        dists = np.zeros((len(rows), n_series), dtype=np.float64)
+        for si in range(n_series):
+            diff = px_rgb - color_arr[si]
+            dists[:, si] = (diff ** 2).sum(axis=1)
+        nearest = np.argmin(dists, axis=1)
+
+        for si in range(n_series):
+            si_mask = nearest == si
+            masks[si][rows[si_mask], cols[si_mask]] = True
+            masks[si] = _clean_mask(masks[si])
+        union = np.zeros(img.shape[:2], dtype=bool)
+        for si in range(n_series):
+            union |= masks[si]
+
+    return masks, union
+
+
 def assess_extraction_accuracy(
     img: np.ndarray,
     data_series: list[dict],
     bounds: PlotBounds,
     axis_range: AxisRange,
     search_radius: int = 30,
+    per_series_masks: list[np.ndarray] | None = None,
 ) -> dict:
     """CV-based extraction accuracy assessment.
 
     For each extracted data point, finds the nearest dark curve pixel
     vertically and measures the discrepancy.
+
+    Args:
+        per_series_masks: Optional list of boolean masks, one per series.
+            When provided, ``per_series_masks[si]`` is used instead of the
+            shared dark mask for series *si*.  Backward compatible — existing
+            callers pass nothing.
 
     Returns dict with per-series metrics, overall metrics, and
     a feedback_text string describing specific errors for AI correction.
@@ -406,7 +910,12 @@ def assess_extraction_accuracy(
     series_results = []
     all_errors: list[float] = []
 
-    for series in data_series:
+    for si, series in enumerate(data_series):
+        series_mask = (
+            per_series_masks[si]
+            if per_series_masks is not None and si < len(per_series_masks)
+            else dark
+        )
         name = series.get("name", "?")
         pts = series.get("data", [])
         errors: list[float] = []
@@ -421,14 +930,14 @@ def assess_extraction_accuracy(
             if col <= bounds.left + 5 or col >= bounds.right - 2:
                 continue
 
-            # Find nearest dark pixel vertically
+            # Find nearest curve pixel vertically
             col_lo = max(bounds.left, col - 2)
             col_hi = min(bounds.right, col + 2)
             actual_row = None
             for dist in range(search_radius + 1):
                 for dr in ([0] if dist == 0 else [-dist, dist]):
                     r = row_expected + dr
-                    if bounds.top <= r <= bounds.bottom and dark[r, col_lo:col_hi + 1].any():
+                    if bounds.top <= r <= bounds.bottom and series_mask[r, col_lo:col_hi + 1].any():
                         actual_row = r
                         break
                 if actual_row is not None:
@@ -654,6 +1163,7 @@ def trace_curve(
     axis_range: AxisRange,
     n_points: int = 250,
     monotonic: str | None = None,
+    ai_guide: list[dict] | None = None,
 ) -> list[dict]:
     """Trace a curve from a color mask within the plot bounds.
 
@@ -666,6 +1176,11 @@ def trace_curve(
         axis_range: Data-coordinate ranges.
         n_points: Number of output points after downsampling.
         monotonic: "decreasing", "increasing", or None.
+        ai_guide: Optional AI data points [{"x", "y"}, ...] used for
+            initialization and jump recovery.  When provided, the first
+            segment is chosen near the AI-expected position (instead of
+            topmost), and large jumps (>30px) are checked against the
+            AI guide before committing.
 
     Returns:
         List of {"x": float, "y": float} dicts.
@@ -677,6 +1192,20 @@ def trace_curve(
         row_min = bounds.top
         row_max = bounds.bottom
 
+    # Build AI-guide interpolation (data-y → pixel-row at each column)
+    _ai_row_at_col: dict[int, float] | None = None
+    if ai_guide and len(ai_guide) >= 2:
+        ai_xs = [p["x"] for p in ai_guide if "x" in p and "y" in p]
+        ai_ys = [p["y"] for p in ai_guide if "x" in p and "y" in p]
+        if len(ai_xs) >= 2:
+            _ai_row_at_col = {}
+            for col in range(bounds.left, bounds.right + 1):
+                x_data = pixel_to_data(col, 0, bounds, axis_range)[0]
+                # Linear interpolation of AI y
+                y_interp = np.interp(x_data, ai_xs, ai_ys)
+                _, row_interp = _data_to_pixel(x_data, y_interp, bounds, axis_range)
+                _ai_row_at_col[col] = float(row_interp)
+
     col_to_row: dict[int, float] = {}
     prev_row: float | None = None
 
@@ -685,9 +1214,10 @@ def trace_curve(
         if len(rows) == 0:
             continue
 
-        # Split into contiguous segments
+        # Split into contiguous segments (gap > 5 merges fragments
+        # separated by anti-aliasing gaps of 3–5 pixels)
         diffs = np.diff(rows)
-        splits = np.where(diffs > 3)[0] + 1
+        splits = np.where(diffs > 5)[0] + 1
         segments = np.split(rows, splits)
 
         candidates = [s for s in segments if len(s) >= 2]
@@ -695,22 +1225,20 @@ def trace_curve(
             continue
 
         if prev_row is not None:
-            if monotonic == "decreasing":
-                # Allow downward movement, limit upward jumps
-                below_or_near = [s for s in candidates if s.mean() >= prev_row - 5]
-                pool = below_or_near if below_or_near else candidates
-            elif monotonic == "increasing":
-                above_or_near = [s for s in candidates if s.mean() <= prev_row + 5]
-                pool = above_or_near if above_or_near else candidates
-            else:
-                pool = candidates
-            best = min(pool, key=lambda s: abs(s.mean() - prev_row))
+            best = min(candidates, key=lambda s: abs(s.mean() - prev_row))
+            # Skip column if nearest segment is too far — likely a
+            # censoring mark, not the actual curve.  Gap interpolation
+            # will fill in the skipped columns later.
+            max_jump = bounds.height * 0.12
+            if abs(best.mean() - prev_row) > max_jump:
+                continue
         else:
-            # First detection: pick topmost (highest y-value in data coords)
-            if monotonic == "decreasing":
-                best = min(candidates, key=lambda s: s.mean())  # topmost pixel row
+            # First detection: use AI guide if available, else largest
+            if _ai_row_at_col is not None and col in _ai_row_at_col:
+                ai_row = _ai_row_at_col[col]
+                best = min(candidates, key=lambda s: abs(s.mean() - ai_row))
             else:
-                best = min(candidates, key=lambda s: s.mean())
+                best = max(candidates, key=len)
 
         center = best.mean()
         col_to_row[col] = center
@@ -1032,11 +1560,13 @@ def extract_curves_from_image(
     series_specs: list[SeriesSpec],
     axis_range: AxisRange,
     n_points: int = 250,
+    bounds_override: PlotBounds | None = None,
 ) -> list[dict]:
     """Extract curves from a chart image using pixel-level color detection.
 
-    Top-level entry point. Auto-detects plot bounds, builds color masks per
-    series, traces each curve, and returns data in the standard format.
+    Top-level entry point. Auto-detects plot bounds (or uses bounds_override),
+    builds color masks per series, traces each curve, and returns data in the
+    standard format.
 
     When multiple series share the same color, switches to multi-curve tracing
     using trace_multi_curves and optionally uses line-style classification to
@@ -1047,12 +1577,13 @@ def extract_curves_from_image(
         series_specs: List of SeriesSpec for each series to trace.
         axis_range: Data-coordinate axis ranges from metadata.
         n_points: Number of output points per series.
+        bounds_override: Pre-computed plot bounds (skips auto-detection).
 
     Returns:
         List of {"name": str, "data": [{"x": float, "y": float}, ...]} dicts.
     """
     img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    bounds = detect_plot_bounds(img)
+    bounds = bounds_override or detect_plot_bounds(img)
     if bounds is None:
         raise ValueError("Could not detect plot boundaries (no axis lines found).")
 
@@ -1227,6 +1758,698 @@ def snap_series_to_pixels(
     return corrected_series
 
 
+def snap_series_to_pixels_guided(
+    image_bytes: bytes,
+    data_series: list[dict],
+    axis_range: AxisRange,
+    series_info: list | None = None,
+    search_radius: int = 25,
+) -> list[dict]:
+    """BW-aware pixel-snap using per-series guided masks.
+
+    For each series, builds a guided mask (band around the AI trajectory)
+    with optional morphological closing for dashed/dotted lines, then snaps
+    points to curve pixels on that mask.  This prevents text pixels and
+    other-series pixels from corrupting the snap.
+
+    Args:
+        image_bytes: Original chart image bytes.
+        data_series: AI-extracted [{"name", "data": [{"x", "y"}, ...]}, ...].
+        axis_range: Data-coordinate axis ranges.
+        series_info: AI-provided series metadata with ``line_style`` etc.
+        search_radius: Max pixel distance to search vertically.
+
+    Returns:
+        Corrected data_series (same structure, more accurate y-values).
+    """
+    img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    bounds = detect_plot_bounds(img)
+    if bounds is None or bounds.height < 20:
+        return data_series
+
+    dark_mask = _build_curve_mask(img, bounds)
+
+    corrected_series: list[dict] = []
+    for si, series in enumerate(data_series):
+        ai_pts = series.get("data", [])
+        series_name = series.get("name", f"Series {si}")
+
+        # Extract line_style from series_info
+        ls = None
+        if series_info and si < len(series_info):
+            ls = series_info[si].get("line_style")
+            if ls == "unknown":
+                ls = None
+
+        # Build guided mask with gap-bridging for dashed/dotted
+        guided = _build_guided_mask(
+            dark_mask, ai_pts, bounds, axis_range, line_style=ls,
+        )
+
+        # Snap on the guided mask
+        snapped = _snap_series_on_mask(
+            guided, ai_pts, bounds, axis_range,
+            search_radius=search_radius,
+        )
+        corrected_series.append({"name": series_name, "data": snapped})
+
+    return corrected_series
+
+
+# ---------------------------------------------------------------------------
+# Per-series snap helpers
+# ---------------------------------------------------------------------------
+
+def _snap_series_on_mask(
+    mask: np.ndarray,
+    series_data: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+    search_radius: int = 25,
+    apply_median: bool = True,
+) -> list[dict]:
+    """Snap a single series' AI points to the nearest curve pixel on *mask*.
+
+    Like ``snap_series_to_pixels`` but operates on a single series with a
+    caller-provided mask (no claimed-pixel tracking needed).
+
+    Args:
+        mask: Boolean mask (H, W) of curve pixels for this series.
+        series_data: List of {"x", "y"} dicts (AI points for one series).
+        bounds: Plot bounds.
+        axis_range: Data-coordinate axis ranges.
+        search_radius: Max vertical pixel distance to search.
+        apply_median: If True (default), apply median filter to smooth snap
+            noise.  Set False to preserve step-function edges.
+
+    Returns:
+        List of {"x", "y"} dicts with corrected y-values.
+    """
+    corrected: list[dict] = []
+    for pt in series_data:
+        if "x" not in pt or "y" not in pt:
+            corrected.append(pt)
+            continue
+        x, y = float(pt["x"]), float(pt["y"])
+        col, row = _data_to_pixel(x, y, bounds, axis_range)
+        col = max(bounds.left, min(bounds.right, col))
+
+        col_lo = max(bounds.left, col - 2)
+        col_hi = min(bounds.right, col + 2)
+
+        best_row: float | None = None
+        for dist in range(search_radius + 1):
+            for dr in ([0] if dist == 0 else [-dist, dist]):
+                r = row + dr
+                if bounds.top <= r <= bounds.bottom and mask[r, col_lo:col_hi + 1].any():
+                    # Refine: find segment center in the band
+                    band = mask[max(bounds.top, r - 2):min(bounds.bottom, r + 3),
+                                col_lo:col_hi + 1]
+                    rows_hit = np.where(band.any(axis=1))[0]
+                    if len(rows_hit):
+                        best_row = float(rows_hit.mean()) + max(bounds.top, r - 2)
+                    else:
+                        best_row = float(r)
+                    break
+            if best_row is not None:
+                break
+
+        if best_row is not None:
+            _, corrected_y = pixel_to_data(col, best_row, bounds, axis_range)
+            corrected.append({"x": round(x, 4), "y": round(corrected_y, 4)})
+        else:
+            corrected.append({"x": round(x, 4), "y": round(y, 4)})
+
+    # Median filter to smooth snap noise
+    if apply_median and len(corrected) >= 5:
+        ys = np.array([p["y"] for p in corrected])
+        smooth = median_filter(ys, size=5)
+        for i, p in enumerate(corrected):
+            p["y"] = round(float(smooth[i]), 4)
+
+    return corrected
+
+
+def _dense_snap_on_mask(
+    mask: np.ndarray,
+    raw_pts: list[dict],
+    ai_pts: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+) -> list[dict]:
+    """Two-pass dense snap: snap trajectory points to curve segments on *mask*.
+
+    Pass 1: For each trajectory point, find the nearest segment in *mask*
+    guided by AI-expected y-values.
+    Pass 2: Interpolate across gaps from successfully snapped points.
+
+    Args:
+        mask: Boolean mask (H, W) of curve pixels for this series.
+        raw_pts: Dense trajectory points [{"x", "y"}, ...] from
+            ``find_trajectory``.
+        ai_pts: AI data points [{"x", "y"}, ...] for this series (used
+            to guide which segment to snap to).
+        bounds: Plot bounds.
+        axis_range: Data-coordinate axis ranges.
+
+    Returns:
+        List of {"x", "y"} dicts — dense, pixel-accurate points.
+    """
+    from scipy.interpolate import interp1d
+
+    # Build AI interpolation for guiding segment selection
+    ai_xs = [p["x"] for p in ai_pts if "x" in p and "y" in p]
+    ai_ys = [p["y"] for p in ai_pts if "x" in p and "y" in p]
+    ai_interp = None
+    if len(ai_xs) >= 2:
+        ai_interp = interp1d(ai_xs, ai_ys, kind="linear",
+                             fill_value="extrapolate", bounds_error=False)
+
+    max_snap_dist = max(8, bounds.height // 15)
+
+    def _snap_col(col: int, expected_row: int) -> float | None:
+        col = max(bounds.left, min(bounds.right, col))
+        col_pixels = mask[bounds.top:bounds.bottom + 1, col]
+        segments = []
+        in_seg = False
+        seg_start = 0
+        for r_off, v in enumerate(col_pixels):
+            if v and not in_seg:
+                seg_start = r_off
+                in_seg = True
+            elif not v and in_seg:
+                segments.append((seg_start + bounds.top, r_off - 1 + bounds.top))
+                in_seg = False
+        if in_seg:
+            segments.append((seg_start + bounds.top, len(col_pixels) - 1 + bounds.top))
+
+        best_row = None
+        best_dist = float("inf")
+        for seg_top, seg_bot in segments:
+            seg_center = (seg_top + seg_bot) // 2
+            dist = abs(seg_center - expected_row)
+            if dist < best_dist:
+                best_dist = dist
+                best_row = seg_center
+
+        if best_row is not None and best_dist <= max_snap_dist:
+            _, snapped_y = pixel_to_data(col, best_row, bounds, axis_range)
+            return round(snapped_y, 4)
+        return None
+
+    # Pass 1: snap to curve segments
+    pass1_pts: list[dict] = []
+    snapped_xs: list[float] = []
+    snapped_ys: list[float] = []
+    for pt in raw_pts:
+        col, _ = _data_to_pixel(pt["x"], pt["y"], bounds, axis_range)
+        if ai_interp is not None:
+            expected_y = float(ai_interp(pt["x"]))
+            _, expected_row = _data_to_pixel(pt["x"], expected_y, bounds, axis_range)
+        else:
+            _, expected_row = _data_to_pixel(pt["x"], pt["y"], bounds, axis_range)
+
+        y_val = _snap_col(col, expected_row)
+        if y_val is not None:
+            pass1_pts.append({"x": pt["x"], "y": y_val, "_snapped": True})
+            snapped_xs.append(pt["x"])
+            snapped_ys.append(y_val)
+        else:
+            pass1_pts.append({"x": pt["x"], "y": None, "_snapped": False})
+
+    # Pass 2: interpolate gaps
+    if len(snapped_xs) >= 2:
+        gap_interp = interp1d(snapped_xs, snapped_ys, kind="linear",
+                              fill_value="extrapolate", bounds_error=False)
+        for p in pass1_pts:
+            if not p["_snapped"]:
+                p["y"] = round(float(gap_interp(p["x"])), 4)
+
+    dense_pts = [{"x": p["x"], "y": p["y"]}
+                 for p in pass1_pts if p["y"] is not None
+                 and axis_range.x_min <= p["x"] <= axis_range.x_max
+                 and axis_range.y_min - 1 <= p["y"] <= axis_range.y_max + 1]
+
+    # Light median filter
+    if len(dense_pts) >= 3:
+        xs = np.array([p["x"] for p in dense_pts])
+        ys = np.array([p["y"] for p in dense_pts])
+        ys = median_filter(ys, size=3)
+        dense_pts = [{"x": round(float(x), 4), "y": round(float(y), 4)}
+                     for x, y in zip(xs, ys)]
+
+    return dense_pts
+
+
+# ---------------------------------------------------------------------------
+# BW guided mask for text-free per-series extraction
+# ---------------------------------------------------------------------------
+
+
+def _build_guided_mask(
+    dark_mask: np.ndarray,
+    ai_pts: list[dict],
+    bounds: PlotBounds,
+    axis_range: AxisRange,
+    guide_radius: int = 30,
+    line_style: str | None = None,
+) -> np.ndarray:
+    """Build a per-series mask by keeping only dark pixels near the AI guide.
+
+    For BW charts where all curves share the same color, this creates a
+    "band mask" around each series' expected trajectory.  Pixels far from
+    the guide (e.g. title text, legend text) are excluded.
+
+    Algorithm: For each column in the plot, interpolate the AI guide to get
+    an expected row.  Keep only ``dark_mask`` pixels within ±guide_radius
+    rows of that expected position.  Zero everything else.
+
+    For dashed/dotted lines, a horizontal morphological closing is applied
+    after band filtering to bridge dash gaps (up to 14px for dashed, 8px
+    for dotted).  The kernel is ``(1, N)`` so it only fills horizontally
+    without expanding vertically (won't merge separate curves).
+
+    Args:
+        dark_mask: Boolean mask of all dark pixels (curves + text + axes).
+        ai_pts: AI-extracted data points for this series [{"x", "y"}, ...].
+        bounds: Plot area pixel boundaries.
+        axis_range: Data-coordinate axis ranges.
+        guide_radius: Max pixel distance from guide to keep (default 30).
+        line_style: One of "solid", "dashed", "dotted", or None.
+            Dashed/dotted triggers horizontal closing to bridge gaps.
+
+    Returns:
+        Boolean mask same shape as dark_mask, with only guided pixels set.
+    """
+    guided = np.zeros_like(dark_mask)
+
+    # Build sorted (col, row) guide from AI points
+    guide_pairs = []
+    for pt in ai_pts:
+        if "x" not in pt or "y" not in pt:
+            continue
+        col, row = _data_to_pixel(float(pt["x"]), float(pt["y"]), bounds, axis_range)
+        guide_pairs.append((col, row))
+    if len(guide_pairs) < 2:
+        # Not enough guide points — return the raw dark_mask clipped to plot
+        guided[bounds.top:bounds.bottom + 1, bounds.left:bounds.right + 1] = \
+            dark_mask[bounds.top:bounds.bottom + 1, bounds.left:bounds.right + 1]
+        return guided
+
+    # Sort by column for interpolation
+    guide_pairs.sort(key=lambda p: p[0])
+    guide_cols = np.array([p[0] for p in guide_pairs], dtype=float)
+    guide_rows = np.array([p[1] for p in guide_pairs], dtype=float)
+
+    # For each plot column, interpolate expected row and apply band filter
+    for col in range(bounds.left, bounds.right + 1):
+        expected_row = np.interp(float(col), guide_cols, guide_rows)
+        row_lo = max(bounds.top, int(expected_row - guide_radius))
+        row_hi = min(bounds.bottom, int(expected_row + guide_radius))
+        guided[row_lo:row_hi + 1, col] = dark_mask[row_lo:row_hi + 1, col]
+
+    # Bridge dash/dot gaps with horizontal morphological closing.
+    # Kernel (1, N) fills gaps up to N-1 px wide without vertical expansion.
+    if line_style in ("dashed", "dotted"):
+        from scipy.ndimage import binary_closing
+        close_width = 15 if line_style == "dashed" else 9
+        h_kernel = np.ones((1, close_width), dtype=bool)
+        guided = binary_closing(guided, structure=h_kernel)
+
+    return guided
+
+
+# ---------------------------------------------------------------------------
+# PlotDigitizer ensemble extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_with_plotdigitizer(
+    image_bytes: bytes,
+    data_series: list[dict],
+    axis_range: AxisRange,
+    *,
+    is_bw: bool | None = None,
+    series_info: list | None = None,
+) -> list[dict]:
+    """Per-series adaptive extraction using color-aware or guided masks.
+
+    For color charts, each series independently:
+      A) Sparse snap on per-series color mask
+      B) Dense snap (plotdigitizer trajectory) on per-series color mask
+      C) Sparse snap on standard dark mask (fallback)
+      D) Column-by-column trace on per-series color mask
+    For BW charts, builds per-series guided masks from AI trajectory,
+    then runs candidates A-C on the guided mask (no multi-trace).
+
+    Args:
+        image_bytes: Original chart image bytes.
+        data_series: AI-extracted series (used for curve count and matching).
+        axis_range: Data-coordinate axis ranges.
+        is_bw: If True, use BW guided-mask path. If False, use color path.
+            If None, auto-detect via _colors_all_similar.
+        series_info: AI-provided series metadata (line styles, colors).
+
+    Returns:
+        data_series in standard format with best-method y-values per series.
+        Raises on failure (caller should catch and fall back).
+    """
+    from plotdigitizer.plotdigitizer import axis_transformation
+    from plotdigitizer.trajectory import find_trajectory
+
+    img_rgb = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    raw_bounds = detect_plot_bounds(img_rgb)
+    if raw_bounds is None or raw_bounds.height < 20:
+        raise ValueError("Plot bounds detection failed for plotdigitizer.")
+
+    # Refine bounds using tick marks for better axis calibration.
+    # Use refined bounds for coordinate conversion, raw bounds for mask
+    # building (to include curve pixels near axes).
+    x_ticks, y_ticks = detect_axis_ticks(img_rgb, raw_bounds)
+
+    # Build dark mask early — needed for origin detection and later steps
+    dark_mask = _build_curve_mask(img_rgb, raw_bounds)
+
+    # Detect curve origin and use origin-anchored calibration
+    calibration_report: dict | None = None
+    origin = _detect_curve_origin(img_rgb, raw_bounds, dark_mask, x_ticks, y_ticks)
+    if origin is not None:
+        bounds, calibration_report = _origin_anchored_calibration(
+            origin, x_ticks, y_ticks, raw_bounds, axis_range,
+        )
+        print(f"[origin] Detected at pixel {origin} → "
+              f"data ({axis_range.x_min}, {axis_range.y_max})")
+        if calibration_report:
+            print(f"[origin] Calibration quality: {calibration_report.get('quality')}")
+            if "tick_mappings" in calibration_report:
+                for tm in calibration_report["tick_mappings"]:
+                    print(f"  tick → {tm}")
+    else:
+        bounds = _refine_bounds_from_ticks(raw_bounds, x_ticks, y_ticks)
+
+    n_series = len(data_series)
+
+    # --- Step 1: Build per-series color masks ---
+    # Use raw_bounds for mask building to capture pixels near axes
+    per_series_masks, union_mask = _build_per_series_masks(
+        img_rgb, data_series, raw_bounds, axis_range,
+    )
+
+    # plotdigitizer calibration (uses refined bounds for accuracy)
+    YROWS = img_rgb.shape[0]
+    data_points = [
+        (axis_range.x_min, axis_range.y_min),
+        (axis_range.x_max, axis_range.y_min),
+        (axis_range.x_min, axis_range.y_max),
+    ]
+    pixel_locations = [
+        (bounds.left, YROWS - bounds.bottom),
+        (bounds.right, YROWS - bounds.bottom),
+        (bounds.left, YROWS - bounds.top),
+    ]
+    T = axis_transformation(data_points, pixel_locations)
+
+    # Remove gridline remnants from the dark mask (use raw_bounds for pixel range)
+    max_col_density = max(15, raw_bounds.height // 8)
+    for col in range(raw_bounds.left, raw_bounds.right + 1):
+        col_count = dark_mask[raw_bounds.top:raw_bounds.bottom + 1, col].sum()
+        if col_count > max_col_density:
+            dark_mask[:, col] = False
+
+    # --- Step 1b: BW vs color routing ---
+    # Determine if chart is BW (auto-detect if is_bw not provided)
+    multi_trace_curves = None
+    _detected_bw = False
+    if is_bw is None and n_series >= 2:
+        colors = _detect_series_colors(img_rgb, data_series, raw_bounds, axis_range)
+        _detected_bw = _colors_all_similar(colors)
+    use_bw_path = is_bw if is_bw is not None else _detected_bw
+
+    if use_bw_path:
+        # BW path: build per-series guided masks from AI trajectory.
+        # This excludes title text/legend text that would confuse tracing.
+        print("[BW path] Building guided masks for %d series" % n_series)
+        for si in range(n_series):
+            ai_pts = data_series[si].get("data", [])
+            # Extract line_style from series_info if available
+            ls = None
+            if series_info and si < len(series_info):
+                ls = series_info[si].get("line_style")
+                if ls == "unknown":
+                    ls = None
+            guided = _build_guided_mask(
+                dark_mask, ai_pts, bounds, axis_range, line_style=ls,
+            )
+            per_series_masks[si] = guided
+        # Disable multi-trace entirely for BW charts — it operates on raw
+        # dark_mask and can't distinguish text from curves, leading to
+        # title-text tracking failures (e.g. lung chart).
+        multi_trace_curves = None
+
+    elif n_series >= 2:
+        # Color path: same-color multi-curve tracing (existing logic)
+        colors = _detect_series_colors(img_rgb, data_series, raw_bounds, axis_range)
+        if _colors_all_similar(colors):
+            # Infer monotonicity from all AI data combined
+            mono = None
+            ai_ys_all = [p["y"] for s in data_series
+                         for p in s.get("data", []) if "y" in p]
+            if (ai_ys_all and len(ai_ys_all) >= 3
+                    and all(ai_ys_all[i] >= ai_ys_all[i + 1]
+                            for i in range(len(ai_ys_all) - 1))):
+                mono = "decreasing"
+            multi_trace_curves = trace_multi_curves(
+                dark_mask, bounds, axis_range,
+                n_curves=n_series, n_points=300, monotonic=mono,
+            )
+            # Match traced curves to AI series by rank order of mean y.
+            # Rank-based matching is more robust than Hungarian here because
+            # AI means are systematically higher (they include the y=1.0
+            # starting point that traces miss near the axis).
+            if multi_trace_curves and any(multi_trace_curves):
+                ai_means = []
+                for s in data_series:
+                    ys = [p["y"] for p in s.get("data", []) if "y" in p]
+                    ai_means.append(np.mean(ys) if ys else 0.0)
+                trace_means = []
+                for curve in multi_trace_curves:
+                    ys = [p["y"] for p in curve if "y" in p]
+                    trace_means.append(np.mean(ys) if ys else 0.0)
+                # Sort both by mean-y descending, pair by rank
+                ai_order = sorted(range(len(ai_means)),
+                                  key=lambda i: ai_means[i], reverse=True)
+                tr_order = sorted(range(len(trace_means)),
+                                  key=lambda i: trace_means[i], reverse=True)
+                reordered = [[] for _ in range(len(ai_means))]
+                for rank in range(min(len(ai_order), len(tr_order))):
+                    reordered[ai_order[rank]] = multi_trace_curves[tr_order[rank]]
+                multi_trace_curves = reordered
+
+    # --- Step 2: For each series, generate candidates and pick best ---
+    result: list[dict] = []
+    for si in range(n_series):
+        series = data_series[si]
+        ai_pts = series.get("data", [])
+        color_mask = per_series_masks[si]
+        series_name = series.get("name", f"Series {si}")
+
+        candidates: list[tuple[str, list[dict]]] = []
+
+        # For same-color charts, Candidates A–D operate on a shared mask
+        # containing ALL curves, so they can't distinguish which curve to
+        # follow and will jump between curves.  Only Candidate E (multi-
+        # trace) properly separates same-color curves, so skip B/D when
+        # multi-trace is available.
+        same_color_mode = multi_trace_curves is not None
+
+        # Candidate A: sparse snap on color mask
+        try:
+            snap_color = _snap_series_on_mask(
+                color_mask, ai_pts, bounds, axis_range,
+            )
+            if snap_color:
+                candidates.append(("snap-color", snap_color))
+        except Exception:
+            pass
+
+        # Candidate B: dense snap on color mask via plotdigitizer trajectory
+        if not same_color_mode:
+            try:
+                # Run trajectory on this series' color mask
+                img_single = np.where(color_mask, np.uint8(0), np.uint8(255))
+                res, _ = find_trajectory(img_single, 0, T)
+                if res and len(res) >= 5:
+                    raw_pts = [{"x": round(float(x), 4), "y": round(float(y), 4)}
+                               for x, y in res]
+                    raw_pts = [p for p in raw_pts
+                               if axis_range.x_min - 0.5 <= p["x"] <= axis_range.x_max + 0.5
+                               and axis_range.y_min - 0.5 <= p["y"] <= axis_range.y_max + 0.5]
+                    if len(raw_pts) >= 5:
+                        dense = _dense_snap_on_mask(
+                            color_mask, raw_pts, ai_pts, bounds, axis_range,
+                        )
+                        if dense:
+                            candidates.append(("dense-color", dense))
+            except Exception:
+                pass
+
+        # Candidate C: sparse snap on standard dark mask
+        # Skip for BW charts — raw dark_mask includes text pixels that
+        # confuse tracing.  The guided mask (Candidate A) already handles it.
+        if not use_bw_path:
+            try:
+                snap_dark = _snap_series_on_mask(
+                    dark_mask, ai_pts, bounds, axis_range,
+                )
+                if snap_dark:
+                    candidates.append(("snap-dark", snap_dark))
+            except Exception:
+                pass
+
+        # Candidate D: trace_curve on color mask (column-by-column tracking)
+        # This follows the actual pixel segments step-by-step, which is
+        # superior for step functions where the AI-guided dense snap
+        # cuts through steps with linear interpolation.
+        if not same_color_mode:
+            try:
+                # Infer monotonicity from AI data
+                ai_ys = [p["y"] for p in ai_pts if "y" in p]
+                mono = None
+                if len(ai_ys) >= 3:
+                    if all(ai_ys[i] >= ai_ys[i + 1] for i in range(len(ai_ys) - 1)):
+                        mono = "decreasing"
+                    elif all(ai_ys[i] <= ai_ys[i + 1] for i in range(len(ai_ys) - 1)):
+                        mono = "increasing"
+                traced = trace_curve(
+                    color_mask, bounds, axis_range,
+                    n_points=300, monotonic=mono,
+                    ai_guide=ai_pts,
+                )
+                if traced and len(traced) >= 5:
+                    candidates.append(("trace-color", traced))
+            except Exception:
+                pass
+
+        # Candidate E: multi-curve trace (same-color spatial separation)
+        if multi_trace_curves is not None and si < len(multi_trace_curves):
+            mt_traced = multi_trace_curves[si]
+            if mt_traced and len(mt_traced) >= 5:
+                candidates.append(("multi-trace", mt_traced))
+
+        # --- Step 3: Assess each candidate using this series' color mask ---
+        if not candidates:
+            # No candidates succeeded — keep AI data as-is
+            result.append({"name": series_name, "data": ai_pts})
+            continue
+
+        y_full_scale = axis_range.y_max - axis_range.y_min
+        mae_tie_threshold = 0.005 * y_full_scale  # 0.5% of y-range
+
+        # Use dark_mask for assessment when per-series mask is too sparse
+        assess_mask = color_mask if color_mask.sum() >= 30 else dark_mask
+
+        scored: list[tuple[str, list[dict], float, int, int]] = []
+        for method_name, cand_pts in candidates:
+            wrapper = [{"name": series_name, "data": cand_pts}]
+            acc = assess_extraction_accuracy(
+                img_rgb, wrapper, bounds, axis_range,
+                per_series_masks=[assess_mask],
+            )
+            sr = acc["series"][0] if acc["series"] else None
+            if sr is None:
+                continue
+            mae = sr["mae"]
+            n_assessed = sr["n_points"]
+            if n_assessed < 2:
+                mae = float("inf")
+            scored.append((method_name, cand_pts, mae, n_assessed, len(cand_pts)))
+
+        if not scored:
+            result.append({"name": series_name, "data": ai_pts})
+            continue
+
+        # Pick best MAE, then prefer dense candidates within tie threshold
+        scored.sort(key=lambda t: t[2])  # sort by MAE
+        best_method, best_data, best_mae, _, _ = scored[0]
+        for method_name, cand_pts, mae, n_assessed, n_data in scored[1:]:
+            if (mae - best_mae <= mae_tie_threshold
+                    and n_data >= 5 * len(best_data)):
+                best_method = method_name
+                best_data = cand_pts
+                best_mae = mae
+                break
+
+        # Ensure curves start correctly near (x_min, y_max).
+        # Multi-trace can't separate converging curves near x=0, so the
+        # initial y-values are often wrong.  Find the first trace point
+        # that roughly matches the AI guide, trim everything before it,
+        # and prepend a dense pixel-snapped prefix for the initial segment.
+        if best_data and len(ai_pts) >= 2:
+            ai_first = ai_pts[0]
+            if "x" in ai_first and "y" in ai_first:
+                ai_y0 = float(ai_first["y"])
+                ext_y0 = float(best_data[0].get("y", 0))
+                y_gap = abs(ext_y0 - ai_y0)
+
+                if y_gap > 0.05 * y_full_scale:
+                    # Build piecewise-linear AI guide for interpolation
+                    ai_xy = [(float(p["x"]), float(p["y"]))
+                             for p in ai_pts if "x" in p and "y" in p]
+                    # Find first trace point matching AI guide within 15%
+                    reliable_idx = 0
+                    tol = 0.15 * y_full_scale
+                    for idx, pt in enumerate(best_data):
+                        px = float(pt.get("x", 0))
+                        py = float(pt.get("y", 0))
+                        # Interpolate AI y at this x
+                        ai_y = None
+                        for k in range(len(ai_xy) - 1):
+                            if ai_xy[k][0] <= px <= ai_xy[k + 1][0]:
+                                dx = ai_xy[k + 1][0] - ai_xy[k][0]
+                                frac = (px - ai_xy[k][0]) / dx if dx > 0 else 0
+                                ai_y = ai_xy[k][1] * (1 - frac) + ai_xy[k + 1][1] * frac
+                                break
+                        if ai_y is not None and abs(py - ai_y) < tol:
+                            reliable_idx = idx
+                            break
+                    # Trim unreliable prefix
+                    best_data = best_data[reliable_idx:]
+                    if best_data:
+                        ext_x0 = float(best_data[0].get("x", 0))
+                        # Dense initial segment via pixel snapping
+                        x_step = ((axis_range.x_max - axis_range.x_min)
+                                  / max(1, bounds.width))
+                        guide_xs = np.arange(axis_range.x_min, ext_x0, x_step)
+                        if len(guide_xs) == 0:
+                            guide_xs = np.array([axis_range.x_min])
+                        ai_x_arr = np.array([p[0] for p in ai_xy])
+                        ai_y_arr = np.array([p[1] for p in ai_xy])
+                        guide_ys = np.interp(guide_xs, ai_x_arr, ai_y_arr)
+                        dense_guide = [
+                            {"x": round(float(x), 4), "y": round(float(y), 4)}
+                            for x, y in zip(guide_xs, guide_ys)
+                        ]
+                        prefix_mask = color_mask if use_bw_path else dark_mask
+                        snapped_prefix = _snap_series_on_mask(
+                            prefix_mask, dense_guide, bounds, axis_range,
+                            search_radius=20, apply_median=False,
+                        )
+                        # Ensure origin included
+                        if (not snapped_prefix
+                                or abs(float(snapped_prefix[0]["x"])
+                                       - axis_range.x_min) > 0.01):
+                            snapped_prefix = [
+                                {"x": round(axis_range.x_min, 4),
+                                 "y": round(axis_range.y_max, 4)}
+                            ] + snapped_prefix
+                        best_data = snapped_prefix + best_data
+
+        result.append({"name": series_name, "data": best_data})
+
+    return result
+
+
+
 # A set of distinct colors for overlay lines (tab20 palette).
 _OVERLAY_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -1240,6 +2463,7 @@ def generate_overlay(
     image_bytes: bytes,
     data_series: list[dict],
     axis_range: AxisRange,
+    bounds_override: PlotBounds | None = None,
 ) -> bytes:
     """Render extracted curves overlaid on the original chart image.
 
@@ -1247,12 +2471,13 @@ def generate_overlay(
         image_bytes: Original chart image bytes.
         data_series: List of {"name": str, "data": [{"x", "y"}, ...]} dicts.
         axis_range: Data-coordinate axis ranges.
+        bounds_override: Pre-computed plot bounds (skips auto-detection).
 
     Returns:
         PNG image bytes of the overlay figure.
     """
     img = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    bounds = detect_plot_bounds(img)
+    bounds = bounds_override or detect_plot_bounds(img)
 
     h, w = img.shape[:2]
 

@@ -5,3 +5,6 @@ openpyxl
 Pillow
 scipy
 matplotlib
+plotdigitizer
+opencv-python-headless
+streamlit-image-coordinates
